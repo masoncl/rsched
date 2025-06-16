@@ -56,6 +56,7 @@ sudo ./target/release/rsched [OPTIONS]
 - `-l, --min-latency <MICROSECONDS>`: Minimum latency threshold
 - `-C, --no-collapse`: Don't collapse/aggregate by command name
 - `-w, --trace-sched-waking`: Trace sched_waking events (adds overhead)
+- `-s, --schedstat': Enable schedstats and output them
 
 ### Examples
 

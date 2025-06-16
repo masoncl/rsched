@@ -1,4 +1,5 @@
 use crate::rsched_collector::{Hist, TimesliceStats, MAX_SLOTS};
+use crate::schedstat::SchedstatData;
 use regex::Regex;
 use std::collections::HashMap;
 use anyhow::Result;
@@ -27,6 +28,7 @@ pub struct RschedStats {
     timeslice_stats: HashMap<u32, TimesliceStatsData>,
     nr_running_stats: HashMap<u32, NrRunningData>,
     waking_delay_stats: HashMap<u32, WakingDelayData>,
+    schedstat_data: Option<SchedstatData>,
 }
 
 struct RschedPidStats {
@@ -104,6 +106,7 @@ impl RschedStats {
             timeslice_stats: HashMap::new(),
             nr_running_stats: HashMap::new(),
             waking_delay_stats: HashMap::new(),
+            schedstat_data: None,
         }
     }
 
@@ -133,6 +136,10 @@ impl RschedStats {
             }
         }
     }
+    pub fn update_schedstat(&mut self, schedstat_data: SchedstatData) {
+        self.schedstat_data = Some(schedstat_data);
+    }
+
 
     pub fn update_timeslices(&mut self, timeslice_data: HashMap<u32, TimesliceStats>) {
         for (pid, new_stats) in timeslice_data {
@@ -184,6 +191,61 @@ impl RschedStats {
         }
     }
 
+    pub fn print_schedstat(&self, schedstat_data: &SchedstatData) {
+        // Print schedstat metrics in 3 columns
+        println!("\n=== System-wide Schedstat Metrics (deltas) ===");
+
+        // Collect all metrics into a sorted vector
+        let mut metrics: Vec<(&String, &u64)> = schedstat_data.domain_totals.iter().collect();
+        metrics.sort_by(|a, b| a.0.cmp(b.0));
+
+        // Print in 3 columns
+        let metrics_per_col = (metrics.len() + 2) / 3;
+
+        for row in 0..metrics_per_col {
+            for col in 0..3 {
+                let idx = col * metrics_per_col + row;
+                if idx < metrics.len() {
+                    let (name, value) = metrics[idx];
+                    print!("{:<30} {:>9} ", name, value);
+                    if col < 2 {
+                        print!("| ");
+                    }
+                }
+            }
+            println!();
+        }
+
+        // Also print CPU field totals
+        if !schedstat_data.cpu_totals.is_empty() {
+            println!("\n=== CPU Field Totals (deltas) ===");
+            let cpu_fields = vec![
+                "yld_count", "sched_count", "sched_goidle", "ttwu_count",
+                "ttwu_local", "rq_cpu_time", "rq_run_delay usec", "rq_pcount"
+            ];
+
+            for (i, field) in cpu_fields.iter().enumerate() {
+                if i < schedstat_data.cpu_totals.len() {
+                    let mut val = schedstat_data.cpu_totals[i];
+                    if *field == "rq_run_delay usec" {
+                        val = val / schedstat_data.cpu_totals[i + 1];
+                    }
+                    print!("{:<17} {:>12} ", field, val);
+                    if (i + 1) % 3 == 0 {
+                        println!();
+                    } else {
+                        print!("| ");
+                    }
+                }
+            }
+            if cpu_fields.len() % 3 != 0 {
+                println!();
+            }
+        }
+
+        println!();
+    }
+
     pub fn print_summary(&self, mode: OutputMode, filters: &FilterOptions) -> Result<()> {
         // Clear screen for better readability
         print!("\x1B[2J\x1B[1;1H");
@@ -208,6 +270,10 @@ impl RschedStats {
             self.print_timeslice_stats(&process_entries, detailed, collapsed)?;
             println!();
             self.print_nr_running_stats(&process_entries, detailed, collapsed)?;
+        }
+        if let Some(data) = &self.schedstat_data {
+            self.print_schedstat(data);
+
         }
 
         // Print CPU stats

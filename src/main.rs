@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 mod rsched_collector;
 mod rsched_stats;
+mod schedstat;
 
 use anyhow::Result;
 use clap::Parser;
@@ -15,6 +16,7 @@ include!(concat!(env!("OUT_DIR"), "/rsched.skel.rs"));
 
 use rsched_collector::RschedCollector;
 use rsched_stats::{RschedStats, OutputMode, FilterOptions};
+use schedstat::SchedstatCollector;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -50,6 +52,15 @@ struct Args {
     /// Trace sched_waking events as well (with added perf overhead)
     #[arg(short = 'w', long)]
     trace_sched_waking: bool,
+
+    /// Enable /proc/schedstat collection and display
+    #[clap(short = 's', long)]
+    schedstat: bool,
+}
+
+fn enable_schedstat() -> Result<()> {
+    std::fs::write("/proc/sys/kernel/sched_schedstats", "1")?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -93,6 +104,12 @@ fn main() -> Result<()> {
     let maps = skel.maps();
     let mut collector = RschedCollector::new(&maps);
     let mut stats = RschedStats::new();
+    let mut schedstat_collector = if args.schedstat {
+        enable_schedstat()?;
+        Some(SchedstatCollector::new()?)
+    } else {
+        None
+    };
 
     let output_mode = if args.detailed {
         OutputMode::Detailed
@@ -158,6 +175,10 @@ fn main() -> Result<()> {
         let timeslice_stats = collector.collect_timeslice_stats()?;
         let nr_running_hists = collector.collect_nr_running_hists()?;
         let waking_delays = collector.collect_waking_delays()?;
+        if let Some(ref mut schedstat) = schedstat_collector {
+            let schedstat_data = schedstat.collect()?;
+            stats.update_schedstat(schedstat_data);
+        }
 
         stats.update(histograms);
         stats.update_cpu(cpu_histograms);
