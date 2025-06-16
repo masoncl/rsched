@@ -5,7 +5,7 @@ mod schedstat;
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::skel::{OpenSkel, SkelBuilder, Skel};
+use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use regex::Regex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 include!(concat!(env!("OUT_DIR"), "/rsched.skel.rs"));
 
 use rsched_collector::RschedCollector;
-use rsched_stats::{RschedStats, OutputMode, FilterOptions};
+use rsched_stats::{FilterOptions, OutputMode, RschedStats};
 use schedstat::SchedstatCollector;
 
 #[derive(Parser, Debug)]
@@ -67,14 +67,21 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // command line comm regex
-    let comm_regex = args.comm.as_ref()
+    let comm_regex = args
+        .comm
+        .as_ref()
         .map(|pattern| Regex::new(pattern))
         .transpose()?;
 
     let running = Arc::new(AtomicBool::new(true));
 
     println!("Starting rsched - Runqueue scheduling delay tracker");
-    if comm_regex.is_some() || args.pid.is_some() || args.min_latency.is_some() || args.no_collapse || args.run_time.is_some() {
+    if comm_regex.is_some()
+        || args.pid.is_some()
+        || args.min_latency.is_some()
+        || args.no_collapse
+        || args.run_time.is_some()
+    {
         println!("Options active:");
         if let Some(ref regex) = comm_regex {
             println!("  - Command pattern: {}", regex.as_str());
