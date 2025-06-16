@@ -56,7 +56,7 @@ sudo ./target/release/rsched [OPTIONS]
 - `-l, --min-latency <MICROSECONDS>`: Minimum latency threshold
 - `-C, --no-collapse`: Don't collapse/aggregate by command name
 - `-w, --trace-sched-waking`: Trace sched_waking events (adds overhead)
-- `-s, --schedstat': Enable schedstats and output them
+- `-s, --schedstat`: Enable schedstats and output them
 
 ### Examples
 
@@ -98,7 +98,7 @@ Tracks how long processes run before context switching:
 - **PREEMPT%**: Percentage of involuntary switches
 
 ### Runqueue Depth
-Shows rq->nr_running when each process was woken
+Shows `rq->nr_running` when each process was woken
 
 ### Per-CPU Statistics
 Displays scheduling delays per CPU core
