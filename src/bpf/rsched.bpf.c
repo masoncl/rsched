@@ -99,6 +99,115 @@ struct {
 	__type(value, struct hist); // Distribution of nr_running values
 } nr_running_hists SEC(".maps");
 
+struct cpu_perf_data {
+    struct hist user_cycles_hist;
+    struct hist kernel_cycles_hist;
+    struct hist user_instructions_hist;
+    struct hist kernel_instructions_hist;
+    __u64 total_user_cycles;
+    __u64 total_kernel_cycles;
+    __u64 total_user_instructions;
+    __u64 total_kernel_instructions;
+    __u64 sample_count;
+};
+
+struct cpu_perf_ctx {
+    __u64 last_user_cycles;
+    __u64 last_kernel_cycles;
+    __u64 last_user_instructions;
+    __u64 last_kernel_instructions;
+    __u32 running_pid;  // Track which PID is currently running
+};
+
+// Map to store CPU performance data per PID
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u32);
+    __type(value, struct cpu_perf_data);
+} cpu_perf_stats SEC(".maps");
+
+// Change the map to be per-CPU instead of per-PID
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);  // Only need one entry per CPU
+    __type(key, __u32);
+    __type(value, struct cpu_perf_ctx);
+} cpu_perf_context SEC(".maps");
+
+// Define perf event maps (one for each counter type)
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, MAX_CPUS);
+} user_cycles_array SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, MAX_CPUS);
+} kernel_cycles_array SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, MAX_CPUS);
+} user_instructions_array SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, MAX_CPUS);
+} kernel_instructions_array SEC(".maps");
+
+// Helper functions to read from perf arrays
+static __always_inline __u64 read_user_cycles(void)
+{
+    __u32 cpu = bpf_get_smp_processor_id();
+    struct bpf_perf_event_value val = {};
+    
+    long ret = bpf_perf_event_read_value(&user_cycles_array, cpu, &val, sizeof(val));
+    if (ret == 0)
+        return val.counter;
+    return 0;
+}
+
+static __always_inline __u64 read_kernel_cycles(void)
+{
+    __u32 cpu = bpf_get_smp_processor_id();
+    struct bpf_perf_event_value val = {};
+    
+    long ret = bpf_perf_event_read_value(&kernel_cycles_array, cpu, &val, sizeof(val));
+    if (ret == 0)
+        return val.counter;
+    return 0;
+}
+
+static __always_inline __u64 read_user_instructions(void)
+{
+    __u32 cpu = bpf_get_smp_processor_id();
+    struct bpf_perf_event_value val = {};
+    
+    long ret = bpf_perf_event_read_value(&user_instructions_array, cpu, &val, sizeof(val));
+    if (ret == 0)
+        return val.counter;
+    return 0;
+}
+
+static __always_inline __u64 read_kernel_instructions(void)
+{
+    __u32 cpu = bpf_get_smp_processor_id();
+    struct bpf_perf_event_value val = {};
+    
+    long ret = bpf_perf_event_read_value(&kernel_instructions_array, cpu, &val, sizeof(val));
+    if (ret == 0)
+        return val.counter;
+    return 0;
+}
 static __always_inline void record_enqueue(__u32 pid, __u64 ts)
 {
 	if (pid) {
@@ -155,6 +264,14 @@ static __always_inline __u32 log2_u64(__u64 v)
 		return log2(hi) + 32;
 	else
 		return log2(v);
+}
+
+static __always_inline __u32 log2_slot(__u64 v)
+{
+	__u32 slot = log2_u64(v);
+	if (slot < MAX_SLOTS)
+		return slot;
+	return MAX_SLOTS - 1;
 }
 
 /*
@@ -231,6 +348,107 @@ cleanup:
 	record_enqueue(pid, ts);
 	return 0;
 }
+
+// Function to update CPU performance metrics
+static __always_inline void update_cpu_perf(__u32 prev_pid, __u32 next_pid)
+{
+    struct cpu_perf_ctx *ctx;
+    struct cpu_perf_data *data;
+    __u64 user_cycles, kernel_cycles, user_inst, kernel_inst;
+    __u32 zero = 0;
+    
+    // Get the per-CPU context
+    ctx = bpf_map_lookup_elem(&cpu_perf_context, &zero);
+    if (!ctx) {
+        // Initialize if not exists
+        struct cpu_perf_ctx new_ctx = {};
+        bpf_map_update_elem(&cpu_perf_context, &zero, &new_ctx, BPF_ANY);
+        ctx = bpf_map_lookup_elem(&cpu_perf_context, &zero);
+        if (!ctx)
+            return;
+    }
+    
+    // Read current counter values
+    user_cycles = read_user_cycles();
+    kernel_cycles = read_kernel_cycles();
+    user_inst = read_user_instructions();
+    kernel_inst = read_kernel_instructions();
+    
+    // If we have a previous task that was running on this CPU
+    if (ctx->running_pid == prev_pid && prev_pid != 0) {
+        // Calculate deltas since this task started running
+        __u64 delta_user_cycles = 0;
+        __u64 delta_kernel_cycles = 0;
+        __u64 delta_user_inst = 0;
+        __u64 delta_kernel_inst = 0;
+        
+        // The deltas represent what happened while prev_pid was running
+        if (user_cycles >= ctx->last_user_cycles)
+            delta_user_cycles = user_cycles - ctx->last_user_cycles;
+        if (kernel_cycles >= ctx->last_kernel_cycles)
+            delta_kernel_cycles = kernel_cycles - ctx->last_kernel_cycles;
+        if (user_inst >= ctx->last_user_instructions)
+            delta_user_inst = user_inst - ctx->last_user_instructions;
+        if (kernel_inst >= ctx->last_kernel_instructions)
+            delta_kernel_inst = kernel_inst - ctx->last_kernel_instructions;
+        
+        // Update stats for the task that was running (prev_pid)
+        data = bpf_map_lookup_elem(&cpu_perf_stats, &prev_pid);
+        if (!data) {
+            static struct cpu_perf_data new_data = {};
+            bpf_map_update_elem(&cpu_perf_stats, &prev_pid, &new_data, BPF_NOEXIST);
+            data = bpf_map_lookup_elem(&cpu_perf_stats, &prev_pid);
+        }
+        
+        if (data) {
+            // Update histograms using log2 for better range coverage
+            __u32 slot;
+            
+            // User cycles histogram
+            if (delta_user_cycles > 0) {
+                slot = log2_slot(delta_user_cycles);
+                if (slot < MAX_SLOTS)
+                    __sync_fetch_and_add(&data->user_cycles_hist.slots[slot], 1);
+            }
+            
+            // Kernel cycles histogram
+            if (delta_kernel_cycles > 0) {
+                slot = log2_slot(delta_kernel_cycles);
+                if (slot < MAX_SLOTS)
+                    __sync_fetch_and_add(&data->kernel_cycles_hist.slots[slot], 1);
+            }
+            
+            // User instructions histogram
+            if (delta_user_inst > 0) {
+                slot = log2_slot(delta_user_inst);
+                if (slot < MAX_SLOTS)
+                    __sync_fetch_and_add(&data->user_instructions_hist.slots[slot], 1);
+            }
+            
+            // Kernel instructions histogram
+            if (delta_kernel_inst > 0) {
+                slot = log2_slot(delta_kernel_inst);
+                if (slot < MAX_SLOTS)
+                    __sync_fetch_and_add(&data->kernel_instructions_hist.slots[slot], 1);
+            }
+            
+            // Also keep totals for IPC calculations
+            __sync_fetch_and_add(&data->total_user_cycles, delta_user_cycles);
+            __sync_fetch_and_add(&data->total_kernel_cycles, delta_kernel_cycles);
+            __sync_fetch_and_add(&data->total_user_instructions, delta_user_inst);
+            __sync_fetch_and_add(&data->total_kernel_instructions, delta_kernel_inst);
+            __sync_fetch_and_add(&data->sample_count, 1);
+        }
+    }
+    
+    // Update the per-CPU context for the next task
+    ctx->last_user_cycles = user_cycles;
+    ctx->last_kernel_cycles = kernel_cycles;
+    ctx->last_user_instructions = user_inst;
+    ctx->last_kernel_instructions = kernel_inst;
+    ctx->running_pid = next_pid;
+}
+
 
 // sched_waking, which can happen really a lot.  Try and make it less
 // expensive by checking task state
@@ -407,7 +625,7 @@ static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
 
 	// Skip idle task (PID 0)
 	if (next_pid == 0)
-		return 0;
+		goto out;
 
 	// Record when this task gets on CPU
 	record_oncpu(next_pid, now);
@@ -417,6 +635,8 @@ static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
 
 	bpf_map_delete_elem(&enqueue_time, &next_pid);
 	bpf_map_delete_elem(&waking_time, &next_pid);
+out:
+	update_cpu_perf(prev_pid, next_pid);
 	return 0;
 }
 
@@ -430,6 +650,7 @@ static __always_inline int handle_exit(struct task_struct *p)
 	bpf_map_delete_elem(&waking_delay, &pid);
 	bpf_map_delete_elem(&timeslice_hists, &pid);
 	bpf_map_delete_elem(&nr_running_hists, &pid);
+	bpf_map_delete_elem(&cpu_perf_stats, &pid);
 	return 0;
 }
 
@@ -496,5 +717,4 @@ int BPF_PROG(handle_process_exit_bft, struct task_struct *p)
 	handle_exit(p);
 	return 0;
 }
-
 char LICENSE[] SEC("license") = "GPL";

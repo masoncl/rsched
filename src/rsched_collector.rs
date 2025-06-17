@@ -2,6 +2,7 @@
 use anyhow::Result;
 use libbpf_rs::{Map, MapFlags};
 use std::collections::HashMap;
+use crate::cpu_metrics::CpuPerfData;
 use plain::Plain;
 
 pub const MAX_SLOTS: usize = 64;
@@ -37,6 +38,7 @@ pub struct RschedCollector<'a> {
     timeslice_hists_map: &'a Map,
     nr_running_hists_map: &'a Map,
     waking_delay_map: &'a Map,
+    cpu_perf_map: &'a Map,
 }
 
 impl<'a> RschedCollector<'a> {
@@ -47,6 +49,7 @@ impl<'a> RschedCollector<'a> {
             timeslice_hists_map: maps.timeslice_hists(),
             nr_running_hists_map: maps.nr_running_hists(),
             waking_delay_map: maps.waking_delay(),
+            cpu_perf_map: maps.cpu_perf_stats(),
         }
     }
 
@@ -107,6 +110,28 @@ impl<'a> RschedCollector<'a> {
             // Delete the entry after reading
             let _ = self.timeslice_hists_map.delete(&key);
         }
+        Ok(results)
+    }
+    pub fn collect_cpu_perf(&mut self) -> Result<HashMap<u32, CpuPerfData>> {
+        let mut results = HashMap::new();
+        
+        // Collect all keys first
+        let keys: Vec<Vec<u8>> = self.cpu_perf_map.keys().collect();
+        
+        for key in keys {
+            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap());
+            let value = self.cpu_perf_map.lookup(&key, MapFlags::ANY)?;
+            
+            if let Some(value) = value {
+                let data = plain::from_bytes::<CpuPerfData>(&value)
+                    .expect("Invalid CPU perf data format");
+                results.insert(pid, *data);
+            }
+            
+            // Delete the entry after reading
+            let _ = self.cpu_perf_map.delete(&key);
+        }
+        
         Ok(results)
     }
 }

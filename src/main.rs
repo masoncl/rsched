@@ -2,7 +2,10 @@
 mod rsched_collector;
 mod rsched_stats;
 mod schedstat;
+mod cpu_metrics;
+mod perf;
 
+use std::collections::HashMap;
 use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder, Skel};
@@ -10,6 +13,7 @@ use regex::Regex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use perf::PerfCounterSetup;
 
 // Include the generated skeleton file
 include!(concat!(env!("OUT_DIR"), "/rsched.skel.rs"));
@@ -17,6 +21,7 @@ include!(concat!(env!("OUT_DIR"), "/rsched.skel.rs"));
 use rsched_collector::RschedCollector;
 use rsched_stats::{RschedStats, OutputMode, FilterOptions};
 use schedstat::SchedstatCollector;
+use cpu_metrics::CpuMetrics;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -56,6 +61,10 @@ struct Args {
     /// Enable /proc/schedstat collection and display
     #[clap(short = 's', long)]
     schedstat: bool,
+    ///
+    /// Enable CPU performance counter metrics
+    #[arg(short = 'm', long)]
+    cpu_metrics: bool,
 }
 
 fn enable_schedstat() -> Result<()> {
@@ -100,6 +109,15 @@ fn main() -> Result<()> {
     open_skel.rodata_mut().trace_sched_waking = args.trace_sched_waking as u32;
     let mut skel = open_skel.load()?;
     skel.attach()?;
+    
+    let _perf_setup = if args.cpu_metrics {
+        let mut setup = PerfCounterSetup::new();
+        setup.setup_and_attach(&skel.maps())?;
+        println!("CPU performance counters enabled");
+        Some(setup)
+    } else {
+        None
+    };
 
     let maps = skel.maps();
     let mut collector = RschedCollector::new(&maps);
@@ -117,6 +135,12 @@ fn main() -> Result<()> {
         OutputMode::Collapsed
     } else {
         OutputMode::Grouped
+    };
+
+    let mut cpu_metrics = if args.cpu_metrics {
+        Some(CpuMetrics::new())
+    } else {
+        None
     };
 
     let filter_options = FilterOptions {
@@ -179,13 +203,33 @@ fn main() -> Result<()> {
             let schedstat_data = schedstat.collect()?;
             stats.update_schedstat(schedstat_data);
         }
+        let cpu_perf_data = if args.cpu_metrics {
+            collector.collect_cpu_perf()?
+        } else {
+            HashMap::new()
+        };
 
         stats.update(histograms);
         stats.update_cpu(cpu_histograms);
         stats.update_timeslices(timeslice_stats);
         stats.update_nr_running(nr_running_hists);
         stats.update_waking_delays(waking_delays);
+
+        if let Some(ref mut metrics) = cpu_metrics {
+            metrics.update(cpu_perf_data);
+        }
+
         stats.print_summary(output_mode, &filter_options)?;
+
+        if let Some(ref mut metrics) = cpu_metrics {
+            let cpu_filters = cpu_metrics::CpuFilterOptions {
+                comm_regex: filter_options.comm_regex.clone(),
+                pid_filter: filter_options.pid_filter,
+                detailed: args.detailed,
+                collapsed: !args.no_collapse,
+            };
+            metrics.print_summary(&cpu_filters);
+        }
     }
 
     println!("\nShutting down rsched...");
