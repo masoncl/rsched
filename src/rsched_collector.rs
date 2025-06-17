@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 use anyhow::Result;
 use libbpf_rs::{Map, MapFlags};
-use std::collections::HashMap;
 use plain::Plain;
+use std::collections::HashMap;
 
 pub const MAX_SLOTS: usize = 64;
 
@@ -77,8 +77,7 @@ impl<'a> RschedCollector<'a> {
             let value = mapper.lookup(&key, MapFlags::ANY)?;
 
             if let Some(value) = value {
-                let hist = plain::from_bytes::<Hist>(&value)
-                    .expect("Invalid histogram format");
+                let hist = plain::from_bytes::<Hist>(&value).expect("Invalid histogram format");
                 results.insert(pid, *hist);
             }
 
