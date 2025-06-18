@@ -57,6 +57,7 @@ sudo ./target/release/rsched [OPTIONS]
 - `-C, --no-collapse`: Don't collapse/aggregate by command name
 - `-w, --trace-sched-waking`: Trace sched_waking events (adds overhead)
 - `-s, --schedstat`: Enable schedstats and output them
+- `-m, --cpu-metrics`: report on cycles and IPC per process
 
 ### Examples
 
