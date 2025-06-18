@@ -102,8 +102,6 @@ struct {
 struct cpu_perf_data {
     struct hist user_cycles_hist;
     struct hist kernel_cycles_hist;
-    struct hist user_instructions_hist;
-    struct hist kernel_instructions_hist;
     __u64 total_user_cycles;
     __u64 total_kernel_cycles;
     __u64 total_user_instructions;
@@ -417,21 +415,7 @@ static __always_inline void update_cpu_perf(__u32 prev_pid, __u32 next_pid)
                 if (slot < MAX_SLOTS)
                     __sync_fetch_and_add(&data->kernel_cycles_hist.slots[slot], 1);
             }
-            
-            // User instructions histogram
-            if (delta_user_inst > 0) {
-                slot = log2_slot(delta_user_inst);
-                if (slot < MAX_SLOTS)
-                    __sync_fetch_and_add(&data->user_instructions_hist.slots[slot], 1);
-            }
-            
-            // Kernel instructions histogram
-            if (delta_kernel_inst > 0) {
-                slot = log2_slot(delta_kernel_inst);
-                if (slot < MAX_SLOTS)
-                    __sync_fetch_and_add(&data->kernel_instructions_hist.slots[slot], 1);
-            }
-            
+
             // Also keep totals for IPC calculations
             __sync_fetch_and_add(&data->total_user_cycles, delta_user_cycles);
             __sync_fetch_and_add(&data->total_kernel_cycles, delta_kernel_cycles);

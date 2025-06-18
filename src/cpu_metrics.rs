@@ -8,8 +8,6 @@ use std::collections::HashMap;
 pub struct CpuPerfData {
     pub user_cycles_hist: Hist,
     pub kernel_cycles_hist: Hist,
-    pub user_instructions_hist: Hist,
-    pub kernel_instructions_hist: Hist,
     pub total_user_cycles: u64,
     pub total_kernel_cycles: u64,
     pub total_user_instructions: u64,
@@ -27,8 +25,6 @@ pub struct CpuMetrics {
 struct PidCpuMetrics {
     user_cycles_hist: Hist,
     kernel_cycles_hist: Hist,
-    user_instructions_hist: Hist,
-    kernel_instructions_hist: Hist,
     total_user_cycles: u64,
     total_kernel_cycles: u64,
     total_user_instructions: u64,
@@ -43,8 +39,6 @@ struct CpuProcessEntry {
     comm: String,
     user_cycles_hist: Hist,
     kernel_cycles_hist: Hist,
-    user_instructions_hist: Hist,
-    kernel_instructions_hist: Hist,
     total_user_cycles: u64,
     total_kernel_cycles: u64,
     total_user_instructions: u64,
@@ -152,8 +146,6 @@ impl CpuMetrics {
             let metrics = self.pid_metrics.entry(pid).or_insert(PidCpuMetrics {
                 user_cycles_hist: Hist::default(),
                 kernel_cycles_hist: Hist::default(),
-                user_instructions_hist: Hist::default(),
-                kernel_instructions_hist: Hist::default(),
                 total_user_cycles: 0,
                 total_kernel_cycles: 0,
                 total_user_instructions: 0,
@@ -166,8 +158,6 @@ impl CpuMetrics {
             for i in 0..MAX_SLOTS {
                 metrics.user_cycles_hist.slots[i] += data.user_cycles_hist.slots[i];
                 metrics.kernel_cycles_hist.slots[i] += data.kernel_cycles_hist.slots[i];
-                metrics.user_instructions_hist.slots[i] += data.user_instructions_hist.slots[i];
-                metrics.kernel_instructions_hist.slots[i] += data.kernel_instructions_hist.slots[i];
             }
 
             metrics.total_user_cycles += data.total_user_cycles;
@@ -236,8 +226,6 @@ impl CpuMetrics {
                         comm: metrics.comm.clone(),
                         user_cycles_hist: Hist::default(),
                         kernel_cycles_hist: Hist::default(),
-                        user_instructions_hist: Hist::default(),
-                        kernel_instructions_hist: Hist::default(),
                         total_user_cycles: 0,
                         total_kernel_cycles: 0,
                         total_user_instructions: 0,
@@ -250,10 +238,6 @@ impl CpuMetrics {
                 for i in 0..MAX_SLOTS {
                     entry.user_cycles_hist.slots[i] += metrics.user_cycles_hist.slots[i];
                     entry.kernel_cycles_hist.slots[i] += metrics.kernel_cycles_hist.slots[i];
-                    entry.user_instructions_hist.slots[i] +=
-                        metrics.user_instructions_hist.slots[i];
-                    entry.kernel_instructions_hist.slots[i] +=
-                        metrics.kernel_instructions_hist.slots[i];
                 }
 
                 entry.total_user_cycles += metrics.total_user_cycles;
@@ -277,8 +261,6 @@ impl CpuMetrics {
                     comm: metrics.comm.clone(),
                     user_cycles_hist: metrics.user_cycles_hist.clone(),
                     kernel_cycles_hist: metrics.kernel_cycles_hist.clone(),
-                    user_instructions_hist: metrics.user_instructions_hist.clone(),
-                    kernel_instructions_hist: metrics.kernel_instructions_hist.clone(),
                     total_user_cycles: metrics.total_user_cycles,
                     total_kernel_cycles: metrics.total_kernel_cycles,
                     total_user_instructions: metrics.total_user_instructions,
@@ -334,7 +316,7 @@ impl CpuMetrics {
         collapsed: bool,
         elapsed_secs: f64,
     ) {
-        println!("\nDetailed CPU Performance by Process:\n");
+        println!("\nDetailed CPU Performance by Process (cycles are per timeslice):\n");
 
         // Sort by total cycles
         let mut sorted_entries = entries.to_vec();
@@ -462,7 +444,7 @@ impl CpuMetrics {
         collapsed: bool,
         elapsed_secs: f64,
     ) {
-        println!("\nCPU Performance by Usage Group:\n");
+        println!("\nCPU Performance by Usage Group (cycles are per timeslice):\n");
 
         let mut perf_groups: HashMap<PerfGroup, Vec<&CpuProcessEntry>> = HashMap::new();
 
