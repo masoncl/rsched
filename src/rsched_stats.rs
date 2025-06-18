@@ -1,8 +1,8 @@
 use crate::rsched_collector::{Hist, TimesliceStats, MAX_SLOTS};
 use crate::schedstat::SchedstatData;
+use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
-use anyhow::Result;
 
 // Add these constants to match BPF
 const LINEAR_STEP: u64 = 10;
@@ -64,11 +64,11 @@ struct ProcessEntry {
 // Latency groups for grouped output
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum LatencyGroup {
-    VeryLow,    // < 10 us
-    Low,        // 10-100 us
-    Medium,     // 100-1000 us (1ms)
-    High,       // 1-10 ms
-    VeryHigh,   // > 10 ms
+    VeryLow,  // < 10 us
+    Low,      // 10-100 us
+    Medium,   // 100-1000 us (1ms)
+    High,     // 1-10 ms
+    VeryHigh, // > 10 ms
 }
 
 impl LatencyGroup {
@@ -140,15 +140,17 @@ impl RschedStats {
         self.schedstat_data = Some(schedstat_data);
     }
 
-
     pub fn update_timeslices(&mut self, timeslice_data: HashMap<u32, TimesliceStats>) {
         for (pid, new_stats) in timeslice_data {
             let comm = Self::get_comm(pid);
 
-            let stats = self.timeslice_stats.entry(pid).or_insert(TimesliceStatsData {
-                stats: TimesliceStats::default(),
-                comm,
-            });
+            let stats = self
+                .timeslice_stats
+                .entry(pid)
+                .or_insert(TimesliceStatsData {
+                    stats: TimesliceStats::default(),
+                    comm,
+                });
 
             // Merge timeslice histograms
             for i in 0..MAX_SLOTS {
@@ -179,10 +181,13 @@ impl RschedStats {
         for (pid, hist) in waking_delays {
             let comm = Self::get_comm(pid);
 
-            let stats = self.waking_delay_stats.entry(pid).or_insert(WakingDelayData {
-                hist: Hist::default(),
-                comm,
-            });
+            let stats = self
+                .waking_delay_stats
+                .entry(pid)
+                .or_insert(WakingDelayData {
+                    hist: Hist::default(),
+                    comm,
+                });
 
             // Merge histograms
             for i in 0..MAX_SLOTS {
@@ -220,8 +225,14 @@ impl RschedStats {
         if !schedstat_data.cpu_totals.is_empty() {
             println!("\n=== CPU Field Totals (deltas) ===");
             let cpu_fields = vec![
-                "yld_count", "sched_count", "sched_goidle", "ttwu_count",
-                "ttwu_local", "rq_cpu_time", "rq_run_delay usec", "rq_pcount"
+                "yld_count",
+                "sched_count",
+                "sched_goidle",
+                "ttwu_count",
+                "ttwu_local",
+                "rq_cpu_time",
+                "rq_run_delay usec",
+                "rq_pcount",
             ];
 
             for (i, field) in cpu_fields.iter().enumerate() {
@@ -273,7 +284,6 @@ impl RschedStats {
         }
         if let Some(data) = &self.schedstat_data {
             self.print_schedstat(data);
-
         }
 
         // Print CPU stats
@@ -282,7 +292,12 @@ impl RschedStats {
         Ok(())
     }
 
-    fn print_waking_delay_stats(&self, entries: &[ProcessEntry], detailed: bool, collapsed: bool) -> Result<()> {
+    fn print_waking_delay_stats(
+        &self,
+        entries: &[ProcessEntry],
+        detailed: bool,
+        collapsed: bool,
+    ) -> Result<()> {
         let title = if collapsed {
             "Collapsed Waking Delay Statistics"
         } else {
@@ -309,10 +324,8 @@ impl RschedStats {
             });
 
             let show_count = sorted_entries.len().min(10);
-            let table_entries: Vec<&ProcessEntry> = sorted_entries.iter()
-                .take(show_count)
-                .copied()
-                .collect();
+            let table_entries: Vec<&ProcessEntry> =
+                sorted_entries.iter().take(show_count).copied().collect();
 
             self.print_waking_delay_table(&table_entries, collapsed);
 
@@ -326,20 +339,35 @@ impl RschedStats {
 
     fn print_waking_delay_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
         // Calculate the maximum command name length
-        let max_comm_len = entries.iter()
+        let max_comm_len = entries
+            .iter()
             .map(|e| e.comm.len())
             .max()
             .unwrap_or(7)
             .max(7);
 
         if collapsed {
-            println!("  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
-                     "COMMAND", "PROCS", "p50", "p90", "p95", "COUNT",
-                     width = max_comm_len);
+            println!(
+                "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
+                "COMMAND",
+                "PROCS",
+                "p50",
+                "p90",
+                "p95",
+                "COUNT",
+                width = max_comm_len
+            );
         } else {
-            println!("  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                     "PID", "COMMAND", "p50", "p90", "p95", "COUNT",
-                     width = max_comm_len);
+            println!(
+                "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
+                "PID",
+                "COMMAND",
+                "p50",
+                "p90",
+                "p95",
+                "COUNT",
+                width = max_comm_len
+            );
         }
 
         for entry in entries {
@@ -353,28 +381,37 @@ impl RschedStats {
             let p95 = self.calculate_percentile(&entry.waking_delay_hist, 95);
 
             if collapsed {
-                println!("  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
-                         &entry.comm,
-                         entry.pids.len(),
-                         p50,
-                         p90,
-                         p95,
-                         total_count,
-                         width = max_comm_len);
+                println!(
+                    "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
+                    &entry.comm,
+                    entry.pids.len(),
+                    p50,
+                    p90,
+                    p95,
+                    total_count,
+                    width = max_comm_len
+                );
             } else {
-                println!("  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                         entry.pids[0],
-                         &entry.comm,
-                         p50,
-                         p90,
-                         p95,
-                         total_count,
-                         width = max_comm_len);
+                println!(
+                    "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
+                    entry.pids[0],
+                    &entry.comm,
+                    p50,
+                    p90,
+                    p95,
+                    total_count,
+                    width = max_comm_len
+                );
             }
         }
     }
 
-    fn print_nr_running_stats(&self, entries: &[ProcessEntry], detailed: bool, collapsed: bool) -> Result<()> {
+    fn print_nr_running_stats(
+        &self,
+        entries: &[ProcessEntry],
+        detailed: bool,
+        collapsed: bool,
+    ) -> Result<()> {
         let title = if collapsed {
             "Collapsed Runqueue Depth Statistics"
         } else {
@@ -400,10 +437,8 @@ impl RschedStats {
             });
 
             let show_count = sorted_entries.len().min(10);
-            let table_entries: Vec<&ProcessEntry> = sorted_entries.iter()
-                .take(show_count)
-                .copied()
-                .collect();
+            let table_entries: Vec<&ProcessEntry> =
+                sorted_entries.iter().take(show_count).copied().collect();
 
             self.print_nr_running_table(&table_entries, collapsed);
 
@@ -417,20 +452,35 @@ impl RschedStats {
 
     fn print_nr_running_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
         // Calculate the maximum command name length
-        let max_comm_len = entries.iter()
+        let max_comm_len = entries
+            .iter()
             .map(|e| e.comm.len())
             .max()
             .unwrap_or(7)
             .max(7);
 
         if collapsed {
-            println!("  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
-                     "COMMAND", "PROCS", "p50", "p90", "p95", "COUNT",
-                     width = max_comm_len);
+            println!(
+                "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
+                "COMMAND",
+                "PROCS",
+                "p50",
+                "p90",
+                "p95",
+                "COUNT",
+                width = max_comm_len
+            );
         } else {
-            println!("  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                     "PID", "COMMAND", "p50", "p90", "p95", "COUNT",
-                     width = max_comm_len);
+            println!(
+                "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
+                "PID",
+                "COMMAND",
+                "p50",
+                "p90",
+                "p95",
+                "COUNT",
+                width = max_comm_len
+            );
         }
 
         for entry in entries {
@@ -444,23 +494,27 @@ impl RschedStats {
             let p95 = self.calculate_nr_running_percentile(&entry.nr_running_hist, 95);
 
             if collapsed {
-                println!("  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
-                         &entry.comm,
-                         entry.pids.len(),
-                         p50,
-                         p90,
-                         p95,
-                         total_count,
-                         width = max_comm_len);
+                println!(
+                    "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
+                    &entry.comm,
+                    entry.pids.len(),
+                    p50,
+                    p90,
+                    p95,
+                    total_count,
+                    width = max_comm_len
+                );
             } else {
-                println!("  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                         entry.pids[0],
-                         &entry.comm,
-                         p50,
-                         p90,
-                         p95,
-                         total_count,
-                         width = max_comm_len);
+                println!(
+                    "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
+                    entry.pids[0],
+                    &entry.comm,
+                    p50,
+                    p90,
+                    p95,
+                    total_count,
+                    width = max_comm_len
+                );
             }
         }
     }
@@ -522,7 +576,7 @@ impl RschedStats {
         }
 
         // If we get here, return a large value
-        1u64 << 27  // ~134 seconds
+        1u64 << 27 // ~134 seconds
     }
 
     // Helper function to get the microsecond range for a histogram slot
@@ -582,8 +636,10 @@ impl RschedStats {
                 if let Some(entry) = comm_map.get_mut(&ts_data.comm) {
                     // Merge timeslice stats
                     for i in 0..MAX_SLOTS {
-                        entry.timeslice_stats.voluntary.slots[i] += ts_data.stats.voluntary.slots[i];
-                        entry.timeslice_stats.involuntary.slots[i] += ts_data.stats.involuntary.slots[i];
+                        entry.timeslice_stats.voluntary.slots[i] +=
+                            ts_data.stats.voluntary.slots[i];
+                        entry.timeslice_stats.involuntary.slots[i] +=
+                            ts_data.stats.involuntary.slots[i];
                     }
                     entry.timeslice_stats.involuntary_count += ts_data.stats.involuntary_count;
                 }
@@ -615,19 +671,25 @@ impl RschedStats {
             self.pid_stats
                 .iter()
                 .filter(|(pid, stats)| {
-                    self.should_include_process(pid, &stats.comm, filters) &&
-                    self.get_total_count(&stats.hist) > 0
+                    self.should_include_process(pid, &stats.comm, filters)
+                        && self.get_total_count(&stats.hist) > 0
                 })
                 .map(|(pid, stats)| {
-                    let ts_stats = self.timeslice_stats.get(pid)
+                    let ts_stats = self
+                        .timeslice_stats
+                        .get(pid)
                         .map(|ts| ts.stats.clone())
                         .unwrap_or_default();
 
-                    let nr_hist = self.nr_running_stats.get(pid)
+                    let nr_hist = self
+                        .nr_running_stats
+                        .get(pid)
                         .map(|nr| nr.hist.clone())
                         .unwrap_or_default();
 
-                    let waking_delay_hist = self.waking_delay_stats.get(pid)
+                    let waking_delay_hist = self
+                        .waking_delay_stats
+                        .get(pid)
                         .map(|wd| wd.hist.clone())
                         .unwrap_or_default();
 
@@ -644,7 +706,12 @@ impl RschedStats {
         }
     }
 
-    fn print_timeslice_stats(&self, entries: &[ProcessEntry], detailed: bool, collapsed: bool) -> Result<()> {
+    fn print_timeslice_stats(
+        &self,
+        entries: &[ProcessEntry],
+        detailed: bool,
+        collapsed: bool,
+    ) -> Result<()> {
         let title = if collapsed {
             "Collapsed Time Slice Statistics"
         } else {
@@ -665,25 +732,29 @@ impl RschedStats {
             let mut sorted_entries: Vec<&ProcessEntry> = entries.iter().collect();
             sorted_entries.sort_by(|a, b| {
                 let a_rate = if a.timeslice_stats.involuntary_count > 0 {
-                    a.timeslice_stats.involuntary_count as f64 /
-                    (self.get_total_count(&a.timeslice_stats.voluntary) +
-                     self.get_total_count(&a.timeslice_stats.involuntary)) as f64
-                } else { 0.0 };
+                    a.timeslice_stats.involuntary_count as f64
+                        / (self.get_total_count(&a.timeslice_stats.voluntary)
+                            + self.get_total_count(&a.timeslice_stats.involuntary))
+                            as f64
+                } else {
+                    0.0
+                };
 
                 let b_rate = if b.timeslice_stats.involuntary_count > 0 {
-                    b.timeslice_stats.involuntary_count as f64 /
-                    (self.get_total_count(&b.timeslice_stats.voluntary) +
-                     self.get_total_count(&b.timeslice_stats.involuntary)) as f64
-                } else { 0.0 };
+                    b.timeslice_stats.involuntary_count as f64
+                        / (self.get_total_count(&b.timeslice_stats.voluntary)
+                            + self.get_total_count(&b.timeslice_stats.involuntary))
+                            as f64
+                } else {
+                    0.0
+                };
 
                 b_rate.partial_cmp(&a_rate).unwrap()
             });
 
             let show_count = sorted_entries.len().min(10);
-            let table_entries: Vec<&ProcessEntry> = sorted_entries.iter()
-                .take(show_count)
-                .copied()
-                .collect();
+            let table_entries: Vec<&ProcessEntry> =
+                sorted_entries.iter().take(show_count).copied().collect();
 
             self.print_timeslice_table(&table_entries, collapsed);
 
@@ -697,20 +768,35 @@ impl RschedStats {
 
     fn print_timeslice_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
         // Calculate the maximum command name length
-        let max_comm_len = entries.iter()
+        let max_comm_len = entries
+            .iter()
             .map(|e| e.comm.len())
             .max()
             .unwrap_or(7)
             .max(7);
 
         if collapsed {
-            println!("  {:<width$} {:<8} {:<12} {:<20} {:<20} {:<12}",
-                     "COMMAND", "PROCS", "INVOL_COUNT", "VOLUNTARY(p50/p90)", "PREEMPTED(p50/p90)", "PREEMPT%",
-                     width = max_comm_len);
+            println!(
+                "  {:<width$} {:<8} {:<12} {:<20} {:<20} {:<12}",
+                "COMMAND",
+                "PROCS",
+                "INVOL_COUNT",
+                "VOLUNTARY(p50/p90)",
+                "PREEMPTED(p50/p90)",
+                "PREEMPT%",
+                width = max_comm_len
+            );
         } else {
-            println!("  {:<8} {:<width$} {:<12} {:<20} {:<20} {:<12}",
-                     "PID", "COMMAND", "INVOL_COUNT", "VOLUNTARY(p50/p90)", "PREEMPTED(p50/p90)", "PREEMPT%",
-                     width = max_comm_len);
+            println!(
+                "  {:<8} {:<width$} {:<12} {:<20} {:<20} {:<12}",
+                "PID",
+                "COMMAND",
+                "INVOL_COUNT",
+                "VOLUNTARY(p50/p90)",
+                "PREEMPTED(p50/p90)",
+                "PREEMPT%",
+                width = max_comm_len
+            );
         }
 
         for entry in entries {
@@ -742,28 +828,37 @@ impl RschedStats {
             };
 
             if collapsed {
-                println!("  {:<width$} {:<8} {:<12} {:<20} {:<20} {:<12.1}%",
-                         &entry.comm,
-                         entry.pids.len(),
-                         entry.timeslice_stats.involuntary_count,
-                         vol_str,
-                         invol_str,
-                         preempt_pct,
-                         width = max_comm_len);
+                println!(
+                    "  {:<width$} {:<8} {:<12} {:<20} {:<20} {:<12.1}%",
+                    &entry.comm,
+                    entry.pids.len(),
+                    entry.timeslice_stats.involuntary_count,
+                    vol_str,
+                    invol_str,
+                    preempt_pct,
+                    width = max_comm_len
+                );
             } else {
-                println!("  {:<8} {:<width$} {:<12} {:<20} {:<20} {:<12.1}%",
-                         entry.pids[0],
-                         &entry.comm,
-                         entry.timeslice_stats.involuntary_count,
-                         vol_str,
-                         invol_str,
-                         preempt_pct,
-                         width = max_comm_len);
+                println!(
+                    "  {:<8} {:<width$} {:<12} {:<20} {:<20} {:<12.1}%",
+                    entry.pids[0],
+                    &entry.comm,
+                    entry.timeslice_stats.involuntary_count,
+                    vol_str,
+                    invol_str,
+                    preempt_pct,
+                    width = max_comm_len
+                );
             }
         }
     }
 
-    fn print_process_stats(&self, entries: &[ProcessEntry], detailed: bool, collapsed: bool) -> Result<()> {
+    fn print_process_stats(
+        &self,
+        entries: &[ProcessEntry],
+        detailed: bool,
+        collapsed: bool,
+    ) -> Result<()> {
         let title = if collapsed {
             "Collapsed Scheduling Delays by Command"
         } else {
@@ -783,7 +878,10 @@ impl RschedStats {
             for entry in entries {
                 let p90 = self.calculate_percentile(&entry.hist, 90);
                 let group = LatencyGroup::from_percentile(p90);
-                latency_groups.entry(group).or_insert_with(Vec::new).push(entry);
+                latency_groups
+                    .entry(group)
+                    .or_insert_with(Vec::new)
+                    .push(entry);
             }
 
             let mut groups: Vec<_> = latency_groups.iter().collect();
@@ -802,10 +900,8 @@ impl RschedStats {
 
                 // Show top 10 by p90
                 let show_count = sorted_entries.len().min(10);
-                let table_entries: Vec<&ProcessEntry> = sorted_entries.iter()
-                    .take(show_count)
-                    .copied()
-                    .collect();
+                let table_entries: Vec<&ProcessEntry> =
+                    sorted_entries.iter().take(show_count).copied().collect();
 
                 self.print_process_table(&table_entries, collapsed);
 
@@ -822,7 +918,8 @@ impl RschedStats {
 
     fn print_process_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
         // Calculate the maximum command name length
-        let max_comm_len = entries.iter()
+        let max_comm_len = entries
+            .iter()
             .map(|e| e.comm.len())
             .max()
             .unwrap_or(7)
@@ -830,13 +927,28 @@ impl RschedStats {
 
         // Use the collapsed parameter to determine format, not the data
         if collapsed {
-            println!("  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12} {:<20}",
-                     "COMMAND", "PROCS", "p50", "p90", "p95", "COUNT", "PIDs",
-                     width = max_comm_len);
+            println!(
+                "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12} {:<20}",
+                "COMMAND",
+                "PROCS",
+                "p50",
+                "p90",
+                "p95",
+                "COUNT",
+                "PIDs",
+                width = max_comm_len
+            );
         } else {
-            println!("  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                     "PID", "COMMAND", "p50", "p90", "p95", "COUNT",
-                     width = max_comm_len);
+            println!(
+                "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
+                "PID",
+                "COMMAND",
+                "p50",
+                "p90",
+                "p95",
+                "COUNT",
+                width = max_comm_len
+            );
         }
 
         for entry in entries {
@@ -847,30 +959,36 @@ impl RschedStats {
 
             if collapsed {
                 let pid_str = self.format_pid_list(&entry.pids);
-                println!("  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12} {:<20}",
-                         &entry.comm,
-                         entry.pids.len(),
-                         p50,
-                         p90,
-                         p95,
-                         total_count,
-                         pid_str,
-                         width = max_comm_len);
+                println!(
+                    "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12} {:<20}",
+                    &entry.comm,
+                    entry.pids.len(),
+                    p50,
+                    p90,
+                    p95,
+                    total_count,
+                    pid_str,
+                    width = max_comm_len
+                );
             } else {
-                println!("  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                         entry.pids[0],
-                         &entry.comm,
-                         p50,
-                         p90,
-                         p95,
-                         total_count,
-                         width = max_comm_len);
+                println!(
+                    "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
+                    entry.pids[0],
+                    &entry.comm,
+                    p50,
+                    p90,
+                    p95,
+                    total_count,
+                    width = max_comm_len
+                );
             }
         }
     }
 
     fn print_cpu_stats(&self, filters: &FilterOptions, detailed: bool) -> Result<()> {
-        let filtered_cpus: Vec<(u32, &Hist)> = self.cpu_stats.iter()
+        let filtered_cpus: Vec<(u32, &Hist)> = self
+            .cpu_stats
+            .iter()
             .filter(|(_, hist)| {
                 let total_count = self.get_total_count(hist);
                 if total_count == 0 {
@@ -896,8 +1014,10 @@ impl RschedStats {
 
         if detailed {
             // Detailed mode: show all CPUs
-            println!("{:<8} {:<10} {:<10} {:<10} {:<12}",
-                     "CPU", "p50", "p90", "p95", "COUNT");
+            println!(
+                "{:<8} {:<10} {:<10} {:<10} {:<12}",
+                "CPU", "p50", "p90", "p95", "COUNT"
+            );
 
             let mut sorted_cpus = filtered_cpus;
             sorted_cpus.sort_by_key(|(cpu, _)| *cpu);
@@ -908,8 +1028,10 @@ impl RschedStats {
                 let p90 = self.calculate_percentile(hist, 90);
                 let p95 = self.calculate_percentile(hist, 95);
 
-                println!("{:<8} {:<10} {:<10} {:<10} {:<12}",
-                         cpu, p50, p90, p95, total_count);
+                println!(
+                    "{:<8} {:<10} {:<10} {:<10} {:<12}",
+                    cpu, p50, p90, p95, total_count
+                );
             }
         } else {
             // Grouped mode: group CPUs by latency
@@ -928,9 +1050,11 @@ impl RschedStats {
                 let mut sorted_cpus = cpus.clone();
                 sorted_cpus.sort();
 
-                println!("{}: CPUs {}",
-                         group.description(),
-                         format_cpu_list(&sorted_cpus));
+                println!(
+                    "{}: CPUs {}",
+                    group.description(),
+                    format_cpu_list(&sorted_cpus)
+                );
 
                 // Show aggregate stats for this CPU group
                 let mut total_hist = Hist::default();
@@ -947,8 +1071,10 @@ impl RschedStats {
                 let p90 = self.calculate_percentile(&total_hist, 90);
                 let p95 = self.calculate_percentile(&total_hist, 95);
 
-                println!("  Aggregate: p50={:<6} p90={:<6} p95={:<6} count={}\n",
-                         p50, p90, p95, total_count);
+                println!(
+                    "  Aggregate: p50={:<6} p90={:<6} p95={:<6} count={}\n",
+                    p50, p90, p95, total_count
+                );
             }
         }
 
@@ -988,17 +1114,22 @@ impl RschedStats {
         sorted_pids.sort();
 
         if sorted_pids.len() <= 3 {
-            sorted_pids.iter()
+            sorted_pids
+                .iter()
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>()
                 .join(",")
         } else {
-            format!("{},...(+{})",
-                    sorted_pids.iter().take(3)
-                        .map(|p| p.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    sorted_pids.len() - 3)
+            format!(
+                "{},...(+{})",
+                sorted_pids
+                    .iter()
+                    .take(3)
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                sorted_pids.len() - 3
+            )
         }
     }
 
