@@ -134,3 +134,9 @@ static __always_inline __s64 get_task_state(void *task)
 		return BPF_CORE_READ(t, __state);
 	return BPF_CORE_READ((struct task_struct___o *)task, state);
 }
+//
+// Helper to read comm safely
+static __always_inline void read_task_comm(char *dst, struct task_struct *task)
+{
+    bpf_probe_read_kernel_str(dst, TASK_COMM_LEN, task->comm);
+}

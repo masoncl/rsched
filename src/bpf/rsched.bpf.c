@@ -6,7 +6,7 @@
 #include <bpf/bpf_tracing.h>
 
 #define TASK_RUNNING 0
-#define TASK_WAKING  0x00000200
+#define TASK_WAKING 0x00000200
 #define MAX_CPUS 1024
 
 // command line args
@@ -28,6 +28,26 @@ struct timeslice_stats {
 	struct hist voluntary; // Time slices ending in voluntary switch
 	struct hist involuntary; // Time slices ending in preemption
 	__u64 involuntary_count; // Count of involuntary switches
+};
+
+struct hist_data {
+	struct hist hist;
+	char comm[TASK_COMM_LEN];
+};
+
+struct timeslice_data {
+	struct timeslice_stats stats;
+	char comm[TASK_COMM_LEN];
+};
+
+struct nr_running_data {
+	struct hist hist;
+	char comm[TASK_COMM_LEN];
+};
+
+struct waking_data {
+	struct hist hist;
+	char comm[TASK_COMM_LEN];
 };
 
 // maps pid->wakeup time from sched_wakeup and sched_wakeup_new tracepoints
@@ -59,7 +79,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 10240);
 	__type(key, __u32);
-	__type(value, struct hist);
+	__type(value, struct hist_data);
 } hists SEC(".maps");
 
 // histogram of waking delay (sched_waking -> sched_switch))
@@ -67,7 +87,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 10240);
 	__type(key, __u32);
-	__type(value, struct hist);
+	__type(value, struct hist_data);
 } waking_delay SEC(".maps");
 
 // histogram of timeslice duration (sched_switch -> sched_switch)
@@ -75,7 +95,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 10240);
 	__type(key, __u32);
-	__type(value, struct timeslice_stats);
+	__type(value, struct timeslice_data);
 } timeslice_hists SEC(".maps");
 
 // histogram of scheduler delay per CPU (sched_wakeup -> sched_switch)
@@ -89,122 +109,131 @@ struct {
 static struct hist zero;
 static struct timeslice_stats zero_ts;
 
-
 // histogram of nr_running distribution when tasks are woken up
 // note, this is a simple linear histogram
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 10240);
 	__type(key, __u32); // PID
-	__type(value, struct hist); // Distribution of nr_running values
+	__type(value,
+	       struct nr_running_data); // Distribution of nr_running values
 } nr_running_hists SEC(".maps");
 
 struct cpu_perf_data {
-    struct hist user_cycles_hist;
-    struct hist kernel_cycles_hist;
-    __u64 total_user_cycles;
-    __u64 total_kernel_cycles;
-    __u64 total_user_instructions;
-    __u64 total_kernel_instructions;
-    __u64 sample_count;
+	struct hist user_cycles_hist;
+	struct hist kernel_cycles_hist;
+	__u64 total_user_cycles;
+	__u64 total_kernel_cycles;
+	__u64 total_user_instructions;
+	__u64 total_kernel_instructions;
+	__u64 sample_count;
+};
+
+struct cpu_perf_data_full {
+	struct cpu_perf_data data;
+	char comm[TASK_COMM_LEN];
 };
 
 struct cpu_perf_ctx {
-    __u64 last_user_cycles;
-    __u64 last_kernel_cycles;
-    __u64 last_user_instructions;
-    __u64 last_kernel_instructions;
-    __u32 running_pid;  // Track which PID is currently running
+	__u64 last_user_cycles;
+	__u64 last_kernel_cycles;
+	__u64 last_user_instructions;
+	__u64 last_kernel_instructions;
+	__u32 running_pid; // Track which PID is currently running
 };
 
 // Map to store CPU performance data per PID
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key, __u32);
-    __type(value, struct cpu_perf_data);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 10240);
+	__type(key, __u32);
+	__type(value, struct cpu_perf_data_full);
 } cpu_perf_stats SEC(".maps");
 
 // Change the map to be per-CPU instead of per-PID
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);  // Only need one entry per CPU
-    __type(key, __u32);
-    __type(value, struct cpu_perf_ctx);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1); // Only need one entry per CPU
+	__type(key, __u32);
+	__type(value, struct cpu_perf_ctx);
 } cpu_perf_context SEC(".maps");
 
 // Define perf event maps (one for each counter type)
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
-    __uint(max_entries, MAX_CPUS);
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
 } user_cycles_array SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
-    __uint(max_entries, MAX_CPUS);
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
 } kernel_cycles_array SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
-    __uint(max_entries, MAX_CPUS);
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
 } user_instructions_array SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
-    __uint(max_entries, MAX_CPUS);
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
 } kernel_instructions_array SEC(".maps");
 
 // Helper functions to read from perf arrays
 static __always_inline __u64 read_user_cycles(void)
 {
-    __u32 cpu = bpf_get_smp_processor_id();
-    struct bpf_perf_event_value val = {};
-    
-    long ret = bpf_perf_event_read_value(&user_cycles_array, cpu, &val, sizeof(val));
-    if (ret == 0)
-        return val.counter;
-    return 0;
+	__u32 cpu = bpf_get_smp_processor_id();
+	struct bpf_perf_event_value val = {};
+
+	long ret = bpf_perf_event_read_value(&user_cycles_array, cpu, &val,
+					     sizeof(val));
+	if (ret == 0)
+		return val.counter;
+	return 0;
 }
 
 static __always_inline __u64 read_kernel_cycles(void)
 {
-    __u32 cpu = bpf_get_smp_processor_id();
-    struct bpf_perf_event_value val = {};
-    
-    long ret = bpf_perf_event_read_value(&kernel_cycles_array, cpu, &val, sizeof(val));
-    if (ret == 0)
-        return val.counter;
-    return 0;
+	__u32 cpu = bpf_get_smp_processor_id();
+	struct bpf_perf_event_value val = {};
+
+	long ret = bpf_perf_event_read_value(&kernel_cycles_array, cpu, &val,
+					     sizeof(val));
+	if (ret == 0)
+		return val.counter;
+	return 0;
 }
 
 static __always_inline __u64 read_user_instructions(void)
 {
-    __u32 cpu = bpf_get_smp_processor_id();
-    struct bpf_perf_event_value val = {};
-    
-    long ret = bpf_perf_event_read_value(&user_instructions_array, cpu, &val, sizeof(val));
-    if (ret == 0)
-        return val.counter;
-    return 0;
+	__u32 cpu = bpf_get_smp_processor_id();
+	struct bpf_perf_event_value val = {};
+
+	long ret = bpf_perf_event_read_value(&user_instructions_array, cpu,
+					     &val, sizeof(val));
+	if (ret == 0)
+		return val.counter;
+	return 0;
 }
 
 static __always_inline __u64 read_kernel_instructions(void)
 {
-    __u32 cpu = bpf_get_smp_processor_id();
-    struct bpf_perf_event_value val = {};
-    
-    long ret = bpf_perf_event_read_value(&kernel_instructions_array, cpu, &val, sizeof(val));
-    if (ret == 0)
-        return val.counter;
-    return 0;
+	__u32 cpu = bpf_get_smp_processor_id();
+	struct bpf_perf_event_value val = {};
+
+	long ret = bpf_perf_event_read_value(&kernel_instructions_array, cpu,
+					     &val, sizeof(val));
+	if (ret == 0)
+		return val.counter;
+	return 0;
 }
 static __always_inline void record_enqueue(__u32 pid, __u64 ts)
 {
@@ -325,13 +354,16 @@ static __always_inline int handle_wakeup(struct task_struct *p)
 	if (!(rq && pid))
 		goto cleanup;
 
-	struct hist *hist = bpf_map_lookup_elem(&nr_running_hists, &pid);
-	if (!hist) {
-		bpf_map_update_elem(&nr_running_hists, &pid, &zero,
+	struct nr_running_data *nr_data =
+		bpf_map_lookup_elem(&nr_running_hists, &pid);
+	if (!nr_data) {
+		static struct nr_running_data new_data = {};
+		bpf_map_update_elem(&nr_running_hists, &pid, &new_data,
 				    BPF_NOEXIST);
-		hist = bpf_map_lookup_elem(&nr_running_hists, &pid);
-		if (!hist)
+		nr_data = bpf_map_lookup_elem(&nr_running_hists, &pid);
+		if (!nr_data)
 			goto cleanup;
+		read_task_comm(nr_data->comm, p);
 	}
 	nr_running = bpf_rq_nr_running(rq);
 	if (nr_running < MAX_SLOTS)
@@ -340,7 +372,7 @@ static __always_inline int handle_wakeup(struct task_struct *p)
 		slot = MAX_SLOTS - 1;
 
 	if (slot < MAX_SLOTS)
-		__sync_fetch_and_add(&hist->slots[slot], 1);
+		__sync_fetch_and_add(&nr_data->hist.slots[slot], 1);
 
 cleanup:
 	record_enqueue(pid, ts);
@@ -348,91 +380,107 @@ cleanup:
 }
 
 // Function to update CPU performance metrics
-static __always_inline void update_cpu_perf(__u32 prev_pid, __u32 next_pid)
+static __always_inline void update_cpu_perf(__u32 prev_pid, __u32 next_pid,
+					    struct task_struct *prev)
 {
-    struct cpu_perf_ctx *ctx;
-    struct cpu_perf_data *data;
-    __u64 user_cycles, kernel_cycles, user_inst, kernel_inst;
-    __u32 zero = 0;
-    
-    // Get the per-CPU context
-    ctx = bpf_map_lookup_elem(&cpu_perf_context, &zero);
-    if (!ctx) {
-        // Initialize if not exists
-        struct cpu_perf_ctx new_ctx = {};
-        bpf_map_update_elem(&cpu_perf_context, &zero, &new_ctx, BPF_ANY);
-        ctx = bpf_map_lookup_elem(&cpu_perf_context, &zero);
-        if (!ctx)
-            return;
-    }
-    
-    // Read current counter values
-    user_cycles = read_user_cycles();
-    kernel_cycles = read_kernel_cycles();
-    user_inst = read_user_instructions();
-    kernel_inst = read_kernel_instructions();
-    
-    // If we have a previous task that was running on this CPU
-    if (ctx->running_pid == prev_pid && prev_pid != 0) {
-        // Calculate deltas since this task started running
-        __u64 delta_user_cycles = 0;
-        __u64 delta_kernel_cycles = 0;
-        __u64 delta_user_inst = 0;
-        __u64 delta_kernel_inst = 0;
-        
-        // The deltas represent what happened while prev_pid was running
-        if (user_cycles >= ctx->last_user_cycles)
-            delta_user_cycles = user_cycles - ctx->last_user_cycles;
-        if (kernel_cycles >= ctx->last_kernel_cycles)
-            delta_kernel_cycles = kernel_cycles - ctx->last_kernel_cycles;
-        if (user_inst >= ctx->last_user_instructions)
-            delta_user_inst = user_inst - ctx->last_user_instructions;
-        if (kernel_inst >= ctx->last_kernel_instructions)
-            delta_kernel_inst = kernel_inst - ctx->last_kernel_instructions;
-        
-        // Update stats for the task that was running (prev_pid)
-        data = bpf_map_lookup_elem(&cpu_perf_stats, &prev_pid);
-        if (!data) {
-            static struct cpu_perf_data new_data = {};
-            bpf_map_update_elem(&cpu_perf_stats, &prev_pid, &new_data, BPF_NOEXIST);
-            data = bpf_map_lookup_elem(&cpu_perf_stats, &prev_pid);
-        }
-        
-        if (data) {
-            // Update histograms using log2 for better range coverage
-            __u32 slot;
-            
-            // User cycles histogram
-            if (delta_user_cycles > 0) {
-                slot = log2_slot(delta_user_cycles);
-                if (slot < MAX_SLOTS)
-                    __sync_fetch_and_add(&data->user_cycles_hist.slots[slot], 1);
-            }
-            
-            // Kernel cycles histogram
-            if (delta_kernel_cycles > 0) {
-                slot = log2_slot(delta_kernel_cycles);
-                if (slot < MAX_SLOTS)
-                    __sync_fetch_and_add(&data->kernel_cycles_hist.slots[slot], 1);
-            }
+	struct cpu_perf_ctx *ctx;
+	struct cpu_perf_data_full *data;
+	__u64 user_cycles, kernel_cycles, user_inst, kernel_inst;
+	__u32 zero = 0;
+	__u32 slot;
 
-            // Also keep totals for IPC calculations
-            __sync_fetch_and_add(&data->total_user_cycles, delta_user_cycles);
-            __sync_fetch_and_add(&data->total_kernel_cycles, delta_kernel_cycles);
-            __sync_fetch_and_add(&data->total_user_instructions, delta_user_inst);
-            __sync_fetch_and_add(&data->total_kernel_instructions, delta_kernel_inst);
-            __sync_fetch_and_add(&data->sample_count, 1);
-        }
-    }
-    
-    // Update the per-CPU context for the next task
-    ctx->last_user_cycles = user_cycles;
-    ctx->last_kernel_cycles = kernel_cycles;
-    ctx->last_user_instructions = user_inst;
-    ctx->last_kernel_instructions = kernel_inst;
-    ctx->running_pid = next_pid;
+	// Get the per-CPU context
+	ctx = bpf_map_lookup_elem(&cpu_perf_context, &zero);
+	if (!ctx) {
+		// Initialize if not exists
+		struct cpu_perf_ctx new_ctx = {};
+		bpf_map_update_elem(&cpu_perf_context, &zero, &new_ctx,
+				    BPF_ANY);
+		ctx = bpf_map_lookup_elem(&cpu_perf_context, &zero);
+		if (!ctx)
+			return;
+	}
+
+	// Read current counter values
+	user_cycles = read_user_cycles();
+	kernel_cycles = read_kernel_cycles();
+	user_inst = read_user_instructions();
+	kernel_inst = read_kernel_instructions();
+
+	// If we have a previous task that was running on this CPU
+	if (ctx->running_pid == prev_pid && prev_pid != 0) {
+		// Calculate deltas since this task started running
+		__u64 delta_user_cycles = 0;
+		__u64 delta_kernel_cycles = 0;
+		__u64 delta_user_inst = 0;
+		__u64 delta_kernel_inst = 0;
+
+		// The deltas represent what happened while prev_pid was running
+		if (user_cycles >= ctx->last_user_cycles)
+			delta_user_cycles = user_cycles - ctx->last_user_cycles;
+		if (kernel_cycles >= ctx->last_kernel_cycles)
+			delta_kernel_cycles =
+				kernel_cycles - ctx->last_kernel_cycles;
+		if (user_inst >= ctx->last_user_instructions)
+			delta_user_inst =
+				user_inst - ctx->last_user_instructions;
+		if (kernel_inst >= ctx->last_kernel_instructions)
+			delta_kernel_inst =
+				kernel_inst - ctx->last_kernel_instructions;
+
+		// Update stats for the task that was running (prev_pid)
+		data = bpf_map_lookup_elem(&cpu_perf_stats, &prev_pid);
+		if (!data) {
+			static struct cpu_perf_data_full new_data = {};
+			bpf_map_update_elem(&cpu_perf_stats, &prev_pid,
+					    &new_data, BPF_NOEXIST);
+			data = bpf_map_lookup_elem(&cpu_perf_stats, &prev_pid);
+			if (!data)
+				goto out;
+			if (prev)
+				read_task_comm(data->comm, prev);
+		}
+
+
+		// User cycles histogram
+		if (delta_user_cycles > 0) {
+			slot = log2_slot(delta_user_cycles);
+			if (slot < MAX_SLOTS)
+				__sync_fetch_and_add(
+					&data->data.user_cycles_hist
+							.slots[slot],
+					1);
+		}
+
+		// Kernel cycles histogram
+		if (delta_kernel_cycles > 0) {
+			slot = log2_slot(delta_kernel_cycles);
+			if (slot < MAX_SLOTS)
+				__sync_fetch_and_add(
+					&data->data.kernel_cycles_hist
+							.slots[slot],
+					1);
+		}
+
+		// Also keep totals for IPC calculations
+		__sync_fetch_and_add(&data->data.total_user_cycles,
+					delta_user_cycles);
+		__sync_fetch_and_add(&data->data.total_kernel_cycles,
+					delta_kernel_cycles);
+		__sync_fetch_and_add(&data->data.total_user_instructions,
+					delta_user_inst);
+		__sync_fetch_and_add(&data->data.total_kernel_instructions,
+					delta_kernel_inst);
+		__sync_fetch_and_add(&data->data.sample_count, 1);
+	}
+out:
+	// Update the per-CPU context for the next task
+	ctx->last_user_cycles = user_cycles;
+	ctx->last_kernel_cycles = kernel_cycles;
+	ctx->last_user_instructions = user_inst;
+	ctx->last_kernel_instructions = kernel_inst;
+	ctx->running_pid = next_pid;
 }
-
 
 // sched_waking, which can happen really a lot.  Try and make it less
 // expensive by checking task state
@@ -454,6 +502,7 @@ static __always_inline int handle_waking(struct task_struct *p)
 // calculate the timeslice when we get switched off the CPU.  Record histograms
 // of both voluntary and involuntary timeslices.
 static __always_inline void update_timeslices(__u32 next_pid, __u32 prev_pid,
+					      struct task_struct *prev,
 					      __u64 now, int involuntary)
 {
 	__u64 *oncpu_ts;
@@ -469,47 +518,48 @@ static __always_inline void update_timeslices(__u32 next_pid, __u32 prev_pid,
 	timeslice = now - *oncpu_ts;
 
 	// Update timeslice histogram
-	struct timeslice_stats *ts_stats = bpf_map_lookup_elem(
-		&timeslice_hists, &prev_pid);
-	if (!ts_stats) {
-		bpf_map_update_elem(&timeslice_hists, &prev_pid,
-					&zero_ts, BPF_NOEXIST);
-		ts_stats = bpf_map_lookup_elem(&timeslice_hists,
-						&prev_pid);
+	struct timeslice_data *ts_data =
+		bpf_map_lookup_elem(&timeslice_hists, &prev_pid);
+	if (!ts_data) {
+		static struct timeslice_data new_data = {};
+		bpf_map_update_elem(&timeslice_hists, &prev_pid, &new_data,
+				    BPF_NOEXIST);
+		ts_data = bpf_map_lookup_elem(&timeslice_hists, &prev_pid);
+		if (!ts_data)
+			goto out;
+		read_task_comm(ts_data->comm, prev);
 	}
 
-	if (ts_stats && timeslice < 10000000000ULL) { // Skip > 10 seconds
+	if (timeslice < 10000000000ULL) { // Skip > 10 seconds
 		__u32 slot = hist_slot(timeslice);
 		if (slot < MAX_SLOTS) {
 			if (involuntary) {
 				// Involuntary context switch
 				__sync_fetch_and_add(
-					&ts_stats->involuntary
-							.slots[slot],
+					&ts_data->stats.involuntary.slots[slot],
 					1);
 				__sync_fetch_and_add(
-					&ts_stats->involuntary_count,
-					1);
+					&ts_data->stats.involuntary_count, 1);
 			} else {
 				// Voluntary context switch
 				__sync_fetch_and_add(
-					&ts_stats->voluntary
-							.slots[slot],
+					&ts_data->stats.voluntary.slots[slot],
 					1);
 			}
 		}
 	}
-
+out:
 	bpf_map_delete_elem(&oncpu_time, &prev_pid);
 }
 
-static __always_inline void update_queue_delay(__u32 next_pid, __u64 now)
+static __always_inline void
+update_queue_delay(__u32 next_pid, struct task_struct *next, __u64 now)
 {
 	__u64 *start_ts;
 	__u64 delay;
 	__u32 slot;
 	__u32 cpu;
-	struct hist *hist;
+	struct hist_data *data;
 
 	// Handle scheduling latency for next task
 	start_ts = bpf_map_lookup_elem(&enqueue_time, &next_pid);
@@ -522,38 +572,39 @@ static __always_inline void update_queue_delay(__u32 next_pid, __u64 now)
 	if (delay > 10000000000ULL)
 		return;
 
-
 	slot = hist_slot(delay);
 	// Update regular scheduling delay histogram
-	hist = bpf_map_lookup_elem(&hists, &next_pid);
-	if (!hist) {
-		bpf_map_update_elem(&hists, &next_pid, &zero, BPF_NOEXIST);
-		hist = bpf_map_lookup_elem(&hists, &next_pid);
-		if (!hist)
+	data = bpf_map_lookup_elem(&hists, &next_pid);
+	if (!data) {
+		static struct hist_data new_data = {};
+		bpf_map_update_elem(&hists, &next_pid, &new_data, BPF_NOEXIST);
+		data = bpf_map_lookup_elem(&hists, &next_pid);
+		if (!data)
 			goto update_cpu;
+		read_task_comm(data->comm, next);
 	}
 
 	if (slot < MAX_SLOTS) {
-		__sync_fetch_and_add(&hist->slots[slot], 1);
+		__sync_fetch_and_add(&data->hist.slots[slot], 1);
 	}
 
 update_cpu:
 	// Update per-CPU histogram
 	cpu = bpf_get_smp_processor_id();
-	hist = bpf_map_lookup_elem(&cpu_hists, &cpu);
-	if (!hist) {
+	struct hist *cpu_hist = bpf_map_lookup_elem(&cpu_hists, &cpu);
+	if (!cpu_hist) {
 		bpf_map_update_elem(&cpu_hists, &cpu, &zero, BPF_NOEXIST);
-		hist = bpf_map_lookup_elem(&cpu_hists, &cpu);
-		if (!hist)
+		cpu_hist = bpf_map_lookup_elem(&cpu_hists, &cpu);
+		if (!cpu_hist)
 			return;
 	}
 	if (slot < MAX_SLOTS) {
-		__sync_fetch_and_add(&hist->slots[slot], 1);
+		__sync_fetch_and_add(&cpu_hist->slots[slot], 1);
 	}
-
 }
 
-static __always_inline void update_waking_delay(__u32 next_pid, __u64 now)
+static __always_inline void
+update_waking_delay(__u32 next_pid, struct task_struct *next, __u64 now)
 {
 	__u64 *start_ts;
 	__u64 delay;
@@ -574,17 +625,21 @@ static __always_inline void update_waking_delay(__u32 next_pid, __u64 now)
 		return;
 
 	// Update regular scheduling delay histogram
-	struct hist *hist = bpf_map_lookup_elem(&waking_delay, &next_pid);
-	if (!hist) {
-		bpf_map_update_elem(&waking_delay, &next_pid, &zero, BPF_NOEXIST);
-		hist = bpf_map_lookup_elem(&waking_delay, &next_pid);
-		if (!hist)
+	struct waking_data *data =
+		bpf_map_lookup_elem(&waking_delay, &next_pid);
+	if (!data) {
+		static struct waking_data new_data = {};
+		bpf_map_update_elem(&waking_delay, &next_pid, &new_data,
+				    BPF_NOEXIST);
+		data = bpf_map_lookup_elem(&waking_delay, &next_pid);
+		if (!data)
 			return;
+		read_task_comm(data->comm, next);
 	}
 
 	slot = hist_slot(delay);
 	if (slot < MAX_SLOTS) {
-		__sync_fetch_and_add(&hist->slots[slot], 1);
+		__sync_fetch_and_add(&data->hist.slots[slot], 1);
 	}
 }
 
@@ -605,7 +660,7 @@ static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
 	}
 
 	// update the timeslice data for the previous task
-	update_timeslices(next_pid, prev_pid, now, involuntary);
+	update_timeslices(next_pid, prev_pid, prev, now, involuntary);
 
 	// Skip idle task (PID 0)
 	if (next_pid == 0)
@@ -614,13 +669,13 @@ static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
 	// Record when this task gets on CPU
 	record_oncpu(next_pid, now);
 
-	update_queue_delay(next_pid, now);
-	update_waking_delay(next_pid, now);
+	update_queue_delay(next_pid, next, now);
+	update_waking_delay(next_pid, next, now);
 
 	bpf_map_delete_elem(&enqueue_time, &next_pid);
 	bpf_map_delete_elem(&waking_time, &next_pid);
 out:
-	update_cpu_perf(prev_pid, next_pid);
+	update_cpu_perf(prev_pid, next_pid, prev);
 	return 0;
 }
 

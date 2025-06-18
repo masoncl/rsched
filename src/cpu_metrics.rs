@@ -139,10 +139,8 @@ impl CpuMetrics {
         1u64 << 63
     }
 
-    pub fn update(&mut self, cpu_data: HashMap<u32, CpuPerfData>) {
-        for (pid, data) in cpu_data {
-            let comm = Self::get_comm(pid);
-
+    pub fn update(&mut self, cpu_data: HashMap<u32, (CpuPerfData, String)>) {
+        for (pid, (data, comm)) in cpu_data {
             let metrics = self.pid_metrics.entry(pid).or_insert(PidCpuMetrics {
                 user_cycles_hist: Hist::default(),
                 kernel_cycles_hist: Hist::default(),
@@ -151,9 +149,12 @@ impl CpuMetrics {
                 total_user_instructions: 0,
                 total_kernel_instructions: 0,
                 sample_count: 0,
-                comm,
+                comm: comm.clone(),
             });
 
+            if metrics.comm != comm {
+                metrics.comm = comm;
+            }
             // Merge histograms
             for i in 0..MAX_SLOTS {
                 metrics.user_cycles_hist.slots[i] += data.user_cycles_hist.slots[i];
@@ -536,12 +537,5 @@ impl CpuMetrics {
                 sorted_pids.len() - 3
             )
         }
-    }
-
-    fn get_comm(pid: u32) -> String {
-        std::fs::read_to_string(format!("/proc/{}/comm", pid))
-            .unwrap_or_else(|_| "<unknown>".to_string())
-            .trim()
-            .to_string()
     }
 }

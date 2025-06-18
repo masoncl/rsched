@@ -6,6 +6,7 @@ use plain::Plain;
 use std::collections::HashMap;
 
 pub const MAX_SLOTS: usize = 64;
+pub const TASK_COMM_LEN: usize = 16;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -22,6 +23,13 @@ impl Default for Hist {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
+pub struct HistData {
+    pub hist: Hist,
+    pub comm: [u8; TASK_COMM_LEN],
+}
+
+#[repr(C)]
 #[derive(Default, Copy, Clone)]
 pub struct TimesliceStats {
     pub voluntary: Hist,
@@ -29,8 +37,80 @@ pub struct TimesliceStats {
     pub involuntary_count: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TimesliceData {
+    pub stats: TimesliceStats,
+    pub comm: [u8; TASK_COMM_LEN],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CpuPerfDataFull {
+    pub data: CpuPerfData,
+    pub comm: [u8; TASK_COMM_LEN],
+}
+
+// Helper trait for comm extraction
+trait CommExtractor {
+    fn comm_str(&self) -> String;
+}
+
+impl CommExtractor for [u8; TASK_COMM_LEN] {
+    fn comm_str(&self) -> String {
+        let end = self.iter().position(|&c| c == 0).unwrap_or(TASK_COMM_LEN);
+        String::from_utf8_lossy(&self[..end]).trim().to_string()
+    }
+}
+
+// Trait for extracting data with comm
+trait WithComm {
+    type Data;
+    fn extract_data(&self) -> Self::Data;
+    fn extract_comm(&self) -> String;
+}
+
+impl WithComm for HistData {
+    type Data = Hist;
+
+    fn extract_data(&self) -> Self::Data {
+        self.hist
+    }
+
+    fn extract_comm(&self) -> String {
+        self.comm.comm_str()
+    }
+}
+
+impl WithComm for TimesliceData {
+    type Data = TimesliceStats;
+
+    fn extract_data(&self) -> Self::Data {
+        self.stats
+    }
+
+    fn extract_comm(&self) -> String {
+        self.comm.comm_str()
+    }
+}
+
+impl WithComm for CpuPerfDataFull {
+    type Data = CpuPerfData;
+
+    fn extract_data(&self) -> Self::Data {
+        self.data
+    }
+
+    fn extract_comm(&self) -> String {
+        self.comm.comm_str()
+    }
+}
+
 unsafe impl Plain for Hist {}
+unsafe impl Plain for HistData {}
 unsafe impl Plain for TimesliceStats {}
+unsafe impl Plain for TimesliceData {}
+unsafe impl Plain for CpuPerfDataFull {}
 
 pub struct RschedCollector<'a> {
     hists_map: &'a Map<'a>,
@@ -53,84 +133,68 @@ impl<'a> RschedCollector<'a> {
         }
     }
 
-    pub fn collect_histograms(&mut self) -> Result<HashMap<u32, Hist>> {
-        return self.collect(self.hists_map);
+    // Generic collection function for data with comm
+    fn collect_with_comm<T, D>(&self, map: &Map) -> Result<HashMap<u32, (D, String)>>
+    where
+        T: Plain + WithComm<Data = D>,
+    {
+        let mut results = HashMap::new();
+        let keys: Vec<Vec<u8>> = map.keys().collect();
+
+        for key in keys {
+            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap());
+            let value = map.lookup(&key, MapFlags::ANY)?;
+
+            if let Some(value) = value {
+                let data = plain::from_bytes::<T>(&value).expect("Invalid data format");
+                results.insert(pid, (data.extract_data(), data.extract_comm()));
+            }
+
+            let _ = map.delete(&key);
+        }
+        Ok(results)
+    }
+
+    // Generic collection function for plain data (no comm)
+    fn collect_plain<T: Plain + Clone>(&self, map: &Map) -> Result<HashMap<u32, T>> {
+        let mut results = HashMap::new();
+        let keys: Vec<Vec<u8>> = map.keys().collect();
+
+        for key in keys {
+            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap());
+            let value = map.lookup(&key, MapFlags::ANY)?;
+
+            if let Some(value) = value {
+                let data = plain::from_bytes::<T>(&value).expect("Invalid data format");
+                results.insert(pid, data.clone());
+            }
+
+            let _ = map.delete(&key);
+        }
+        Ok(results)
+    }
+
+    pub fn collect_histograms(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
+        self.collect_with_comm::<HistData, Hist>(self.hists_map)
     }
 
     pub fn collect_cpu_histograms(&mut self) -> Result<HashMap<u32, Hist>> {
-        return self.collect(self.cpu_hists_map);
+        self.collect_plain::<Hist>(self.cpu_hists_map)
     }
 
-    pub fn collect_nr_running_hists(&mut self) -> Result<HashMap<u32, Hist>> {
-        return self.collect(self.nr_running_hists_map);
+    pub fn collect_nr_running_hists(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
+        self.collect_with_comm::<HistData, Hist>(self.nr_running_hists_map)
     }
 
-    pub fn collect_waking_delays(&mut self) -> Result<HashMap<u32, Hist>> {
-        return self.collect(self.waking_delay_map);
+    pub fn collect_waking_delays(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
+        self.collect_with_comm::<HistData, Hist>(self.waking_delay_map)
     }
 
-    fn collect(&mut self, mapper: &Map) -> Result<HashMap<u32, Hist>> {
-        let mut results = HashMap::new();
-
-        // Collect all keys first to avoid borrowing issues
-        let keys: Vec<Vec<u8>> = mapper.keys().collect();
-
-        for key in keys {
-            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap());
-            let value = mapper.lookup(&key, MapFlags::ANY)?;
-
-            if let Some(value) = value {
-                let hist = plain::from_bytes::<Hist>(&value).expect("Invalid histogram format");
-                results.insert(pid, *hist);
-            }
-
-            // Delete the entry after reading
-            let _ = mapper.delete(&key);
-        }
-        Ok(results)
+    pub fn collect_timeslice_stats(&mut self) -> Result<HashMap<u32, (TimesliceStats, String)>> {
+        self.collect_with_comm::<TimesliceData, TimesliceStats>(self.timeslice_hists_map)
     }
 
-    pub fn collect_timeslice_stats(&mut self) -> Result<HashMap<u32, TimesliceStats>> {
-        let mut results = HashMap::new();
-
-        // Collect all keys first to avoid borrowing issues
-        let keys: Vec<Vec<u8>> = self.timeslice_hists_map.keys().collect();
-
-        for key in keys {
-            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap());
-            let value = self.timeslice_hists_map.lookup(&key, MapFlags::ANY)?;
-
-            if let Some(value) = value {
-                let stats = plain::from_bytes::<TimesliceStats>(&value)
-                    .expect("Invalid timeslice stats format");
-                results.insert(pid, *stats);
-            }
-
-            // Delete the entry after reading
-            let _ = self.timeslice_hists_map.delete(&key);
-        }
-        Ok(results)
-    }
-    pub fn collect_cpu_perf(&mut self) -> Result<HashMap<u32, CpuPerfData>> {
-        let mut results = HashMap::new();
-
-        // Collect all keys first
-        let keys: Vec<Vec<u8>> = self.cpu_perf_map.keys().collect();
-
-        for key in keys {
-            let pid = u32::from_ne_bytes(key[..4].try_into().unwrap());
-            let value = self.cpu_perf_map.lookup(&key, MapFlags::ANY)?;
-
-            if let Some(value) = value {
-                let data =
-                    plain::from_bytes::<CpuPerfData>(&value).expect("Invalid CPU perf data format");
-                results.insert(pid, *data);
-            }
-
-            // Delete the entry after reading
-            let _ = self.cpu_perf_map.delete(&key);
-        }
-
-        Ok(results)
+    pub fn collect_cpu_perf(&mut self) -> Result<HashMap<u32, (CpuPerfData, String)>> {
+        self.collect_with_comm::<CpuPerfDataFull, CpuPerfData>(self.cpu_perf_map)
     }
 }

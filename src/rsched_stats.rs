@@ -110,14 +110,16 @@ impl RschedStats {
         }
     }
 
-    pub fn update(&mut self, histograms: HashMap<u32, Hist>) {
-        for (pid, hist) in histograms {
-            let comm = Self::get_comm(pid);
-
+    pub fn update(&mut self, histograms: HashMap<u32, (Hist, String)>) {
+        for (pid, (hist, comm)) in histograms {
             let stats = self.pid_stats.entry(pid).or_insert(RschedPidStats {
                 hist: Hist::default(),
-                comm,
+                comm: comm.clone(),
             });
+
+            if stats.comm != comm {
+                stats.comm = comm;
+            }
 
             // Merge histograms
             for i in 0..MAX_SLOTS {
@@ -140,17 +142,19 @@ impl RschedStats {
         self.schedstat_data = Some(schedstat_data);
     }
 
-    pub fn update_timeslices(&mut self, timeslice_data: HashMap<u32, TimesliceStats>) {
-        for (pid, new_stats) in timeslice_data {
-            let comm = Self::get_comm(pid);
-
+    pub fn update_timeslices(&mut self, timeslice_data: HashMap<u32, (TimesliceStats, String)>) {
+        for (pid, (new_stats, comm)) in timeslice_data {
             let stats = self
                 .timeslice_stats
                 .entry(pid)
                 .or_insert(TimesliceStatsData {
                     stats: TimesliceStats::default(),
-                    comm,
+                    comm: comm.clone(),
                 });
+
+            if stats.comm != comm {
+                stats.comm = comm;
+            }
 
             // Merge timeslice histograms
             for i in 0..MAX_SLOTS {
@@ -161,13 +165,11 @@ impl RschedStats {
         }
     }
 
-    pub fn update_nr_running(&mut self, nr_running_data: HashMap<u32, Hist>) {
-        for (pid, hist) in nr_running_data {
-            let comm = Self::get_comm(pid);
-
+    pub fn update_nr_running(&mut self, nr_running_data: HashMap<u32, (Hist, String)>) {
+        for (pid, (hist, comm)) in nr_running_data {
             let stats = self.nr_running_stats.entry(pid).or_insert(NrRunningData {
                 hist: Hist::default(),
-                comm,
+                comm: comm.clone(),
             });
 
             // Merge histograms
@@ -177,16 +179,14 @@ impl RschedStats {
         }
     }
 
-    pub fn update_waking_delays(&mut self, waking_delays: HashMap<u32, Hist>) {
-        for (pid, hist) in waking_delays {
-            let comm = Self::get_comm(pid);
-
+    pub fn update_waking_delays(&mut self, waking_delays: HashMap<u32, (Hist, String)>) {
+        for (pid, (hist, comm)) in waking_delays {
             let stats = self
                 .waking_delay_stats
                 .entry(pid)
                 .or_insert(WakingDelayData {
                     hist: Hist::default(),
-                    comm,
+                    comm: comm.clone(),
                 });
 
             // Merge histograms
@@ -1133,13 +1133,6 @@ impl RschedStats {
                 sorted_pids.len() - 3
             )
         }
-    }
-
-    fn get_comm(pid: u32) -> String {
-        std::fs::read_to_string(format!("/proc/{}/comm", pid))
-            .unwrap_or_else(|_| "<unknown>".to_string())
-            .trim()
-            .to_string()
     }
 
     fn get_total_count(&self, hist: &Hist) -> u64 {
