@@ -258,8 +258,10 @@ impl RschedStats {
     }
 
     pub fn print_summary(&self, mode: OutputMode, filters: &FilterOptions) -> Result<()> {
-        // Clear screen for better readability
-        print!("\x1B[2J\x1B[1;1H");
+        // Clear screen for better readability only if stdout is a TTY
+        if atty::is(atty::Stream::Stdout) {
+            print!("\x1B[2J\x1B[1;1H");
+        }
 
         let detailed = matches!(mode, OutputMode::Detailed);
         let collapsed = matches!(mode, OutputMode::Collapsed);
