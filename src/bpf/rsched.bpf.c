@@ -673,7 +673,8 @@ static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
 	update_waking_delay(next_pid, next, now);
 
 	bpf_map_delete_elem(&enqueue_time, &next_pid);
-	bpf_map_delete_elem(&waking_time, &next_pid);
+	if (trace_sched_waking)
+		bpf_map_delete_elem(&waking_time, &next_pid);
 out:
 	update_cpu_perf(prev_pid, next_pid, prev);
 	return 0;
@@ -683,10 +684,12 @@ static __always_inline int handle_exit(struct task_struct *p)
 {
 	__u32 pid = BPF_CORE_READ(p, pid);
 	bpf_map_delete_elem(&enqueue_time, &pid);
-	bpf_map_delete_elem(&waking_time, &pid);
+	if (trace_sched_waking) {
+		bpf_map_delete_elem(&waking_time, &pid);
+		bpf_map_delete_elem(&waking_delay, &pid);
+	}
 	bpf_map_delete_elem(&oncpu_time, &pid);
 	bpf_map_delete_elem(&hists, &pid);
-	bpf_map_delete_elem(&waking_delay, &pid);
 	bpf_map_delete_elem(&timeslice_hists, &pid);
 	bpf_map_delete_elem(&nr_running_hists, &pid);
 	bpf_map_delete_elem(&cpu_perf_stats, &pid);

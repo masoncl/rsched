@@ -122,6 +122,14 @@ fn main() -> Result<()> {
         .unwrap()
         .trace_sched_waking = args.trace_sched_waking as u32;
 
+    if !args.trace_sched_waking {
+        // Disable both BTF and raw tracepoint versions to reduce overhead
+        open_skel.progs.handle_sched_waking_btf.set_autoload(false);
+        open_skel.progs.handle_sched_waking_raw.set_autoload(false);
+
+        println!("Sched_waking tracepoints disabled for better performance");
+    }
+
     let mut skel = open_skel.load()?;
     skel.attach()?;
 
