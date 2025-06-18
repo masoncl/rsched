@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 use crate::cpu_metrics::CpuPerfData;
 use anyhow::Result;
-use libbpf_rs::{Map, MapFlags};
+use libbpf_rs::{Map, MapCore, MapFlags};
 use plain::Plain;
 use std::collections::HashMap;
 
@@ -33,23 +33,23 @@ unsafe impl Plain for Hist {}
 unsafe impl Plain for TimesliceStats {}
 
 pub struct RschedCollector<'a> {
-    hists_map: &'a Map,
-    cpu_hists_map: &'a Map,
-    timeslice_hists_map: &'a Map,
-    nr_running_hists_map: &'a Map,
-    waking_delay_map: &'a Map,
-    cpu_perf_map: &'a Map,
+    hists_map: &'a Map<'a>,
+    cpu_hists_map: &'a Map<'a>,
+    timeslice_hists_map: &'a Map<'a>,
+    nr_running_hists_map: &'a Map<'a>,
+    waking_delay_map: &'a Map<'a>,
+    cpu_perf_map: &'a Map<'a>,
 }
 
 impl<'a> RschedCollector<'a> {
     pub fn new(maps: &'a crate::RschedMaps) -> Self {
         Self {
-            hists_map: maps.hists(),
-            cpu_hists_map: maps.cpu_hists(),
-            timeslice_hists_map: maps.timeslice_hists(),
-            nr_running_hists_map: maps.nr_running_hists(),
-            waking_delay_map: maps.waking_delay(),
-            cpu_perf_map: maps.cpu_perf_stats(),
+            hists_map: &maps.hists,
+            cpu_hists_map: &maps.cpu_hists,
+            timeslice_hists_map: &maps.timeslice_hists,
+            nr_running_hists_map: &maps.nr_running_hists,
+            waking_delay_map: &maps.waking_delay,
+            cpu_perf_map: &maps.cpu_perf_stats,
         }
     }
 

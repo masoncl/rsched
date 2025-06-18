@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 use anyhow::{bail, Result};
-use libbpf_rs::{Map, MapFlags};
+use libbpf_rs::{Map, MapCore, MapFlags};
 use std::os::unix::io::RawFd;
 
 const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 0x00000008;
@@ -91,10 +91,10 @@ impl PerfCounterSetup {
         let num_cpus = num_cpus::get();
 
         // Get the BPF perf event array maps using the generated accessors
-        let user_cycles_map = maps.user_cycles_array();
-        let kernel_cycles_map = maps.kernel_cycles_array();
-        let user_instructions_map = maps.user_instructions_array();
-        let kernel_instructions_map = maps.kernel_instructions_array();
+        let user_cycles_map = &maps.user_cycles_array;
+        let kernel_cycles_map = &maps.kernel_cycles_array;
+        let user_instructions_map = &maps.user_instructions_array;
+        let kernel_instructions_map = &maps.kernel_instructions_array;
 
         // Setup counters for each CPU
         for cpu in 0..num_cpus {

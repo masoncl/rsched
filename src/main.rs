@@ -11,6 +11,7 @@ use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use perf::PerfCounterSetup;
 use regex::Regex;
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -111,22 +112,29 @@ fn main() -> Result<()> {
     println!("Press Ctrl-C to stop...\n");
 
     let skel_builder = RschedSkelBuilder::default();
-    let mut open_skel = skel_builder.open()?;
+    let mut open_object = MaybeUninit::uninit();
+    let mut open_skel = skel_builder.open(&mut open_object)?;
 
-    open_skel.rodata_mut().trace_sched_waking = args.trace_sched_waking as u32;
+    open_skel
+        .maps
+        .rodata_data
+        .as_deref_mut()
+        .unwrap()
+        .trace_sched_waking = args.trace_sched_waking as u32;
+
     let mut skel = open_skel.load()?;
     skel.attach()?;
 
     let _perf_setup = if args.cpu_metrics {
         let mut setup = PerfCounterSetup::new();
-        setup.setup_and_attach(&skel.maps())?;
+        setup.setup_and_attach(&skel.maps)?;
         println!("CPU performance counters enabled");
         Some(setup)
     } else {
         None
     };
 
-    let maps = skel.maps();
+    let maps = &skel.maps;
     let mut collector = RschedCollector::new(&maps);
     let mut stats = RschedStats::new();
     let mut schedstat_collector = if args.schedstat {
