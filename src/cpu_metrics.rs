@@ -74,11 +74,11 @@ impl PerfGroup {
 
     fn description(&self) -> &'static str {
         match self {
-            PerfGroup::VeryLow => "Very Low (<10M cycles p95)",
-            PerfGroup::Low => "Low (10-100M cycles p95)",
-            PerfGroup::Medium => "Medium (100M-1G cycles p95)",
-            PerfGroup::High => "High (1-10G cycles p95)",
-            PerfGroup::VeryHigh => "Very High (>10G cycles p95)",
+            PerfGroup::VeryLow => "Very Low (<10M cycles p99)",
+            PerfGroup::Low => "Low (10-100M cycles p99)",
+            PerfGroup::Medium => "Medium (100M-1G cycles p99)",
+            PerfGroup::High => "High (1-10G cycles p99)",
+            PerfGroup::VeryHigh => "Very High (>10G cycles p99)",
         }
     }
 }
@@ -350,8 +350,8 @@ impl CpuMetrics {
                 "  {:<width$} {:<8} {:<20} {:<20} {:<8} {:<8} {:<15}",
                 "COMMAND",
                 "PROCS",
-                "USER CYC(p50/p95)",
-                "KERN CYC(p50/p95)",
+                "USER CYC(p50/p99)",
+                "KERN CYC(p50/p99)",
                 "U-IPC",
                 "K-IPC",
                 "PIDs",
@@ -362,8 +362,8 @@ impl CpuMetrics {
                 "  {:<8} {:<width$} {:<20} {:<20} {:<8} {:<8}",
                 "PID",
                 "COMMAND",
-                "USER CYC(p50/p95)",
-                "KERN CYC(p50/p95)",
+                "USER CYC(p50/p99)",
+                "KERN CYC(p50/p99)",
                 "U-IPC",
                 "K-IPC",
                 width = max_comm_len
@@ -373,9 +373,9 @@ impl CpuMetrics {
         for entry in entries {
             // Calculate percentiles for cycles
             let user_p50 = self.calculate_percentile(&entry.user_cycles_hist, 50);
-            let user_p95 = self.calculate_percentile(&entry.user_cycles_hist, 95);
+            let user_p99 = self.calculate_percentile(&entry.user_cycles_hist, 99);
             let kernel_p50 = self.calculate_percentile(&entry.kernel_cycles_hist, 50);
-            let kernel_p95 = self.calculate_percentile(&entry.kernel_cycles_hist, 95);
+            let kernel_p99 = self.calculate_percentile(&entry.kernel_cycles_hist, 99);
 
             // Format as K/M/G for readability
             let format_cycles = |cycles: u64| -> String {
@@ -391,11 +391,11 @@ impl CpuMetrics {
             };
 
             let user_cycles_str =
-                format!("{}/{}", format_cycles(user_p50), format_cycles(user_p95));
+                format!("{}/{}", format_cycles(user_p50), format_cycles(user_p99));
             let kernel_cycles_str = format!(
                 "{}/{}",
                 format_cycles(kernel_p50),
-                format_cycles(kernel_p95)
+                format_cycles(kernel_p99)
             );
 
             // IPC calculations remain the same (ratio doesn't change with averaging)
@@ -450,12 +450,12 @@ impl CpuMetrics {
         let mut perf_groups: HashMap<PerfGroup, Vec<&CpuProcessEntry>> = HashMap::new();
 
         for entry in entries {
-            // Use p95 of total cycles (user + kernel) for grouping
-            let user_p95 = self.calculate_percentile(&entry.user_cycles_hist, 95);
-            let kernel_p95 = self.calculate_percentile(&entry.kernel_cycles_hist, 95);
-            let total_p95_mcycles = (user_p95 + kernel_p95) as f64 / 1_000_000.0;
+            // Use p99 of total cycles (user + kernel) for grouping
+            let user_p99 = self.calculate_percentile(&entry.user_cycles_hist, 99);
+            let kernel_p99 = self.calculate_percentile(&entry.kernel_cycles_hist, 99);
+            let total_p99_mcycles = (user_p99 + kernel_p99) as f64 / 1_000_000.0;
 
-            let group = PerfGroup::from_mcycles_per_sec(total_p95_mcycles);
+            let group = PerfGroup::from_mcycles_per_sec(total_p99_mcycles);
             perf_groups
                 .entry(group)
                 .or_insert_with(Vec::new)
@@ -468,16 +468,16 @@ impl CpuMetrics {
         for (group, group_entries) in groups.iter().rev() {
             println!("{} ({} entries):", group.description(), group_entries.len());
 
-            // Sort within group by p95 total cycles
+            // Sort within group by p99 total cycles
             let mut sorted_entries: Vec<&CpuProcessEntry> = group_entries.to_vec().clone();
             sorted_entries.sort_by(|a, b| {
-                let a_user_p95 = self.calculate_percentile(&a.user_cycles_hist, 95);
-                let a_kernel_p95 = self.calculate_percentile(&a.kernel_cycles_hist, 95);
-                let b_user_p95 = self.calculate_percentile(&b.user_cycles_hist, 95);
-                let b_kernel_p95 = self.calculate_percentile(&b.kernel_cycles_hist, 95);
+                let a_user_p99 = self.calculate_percentile(&a.user_cycles_hist, 99);
+                let a_kernel_p99 = self.calculate_percentile(&a.kernel_cycles_hist, 99);
+                let b_user_p99 = self.calculate_percentile(&b.user_cycles_hist, 99);
+                let b_kernel_p99 = self.calculate_percentile(&b.kernel_cycles_hist, 99);
 
-                let a_total = a_user_p95 + a_kernel_p95;
-                let b_total = b_user_p95 + b_kernel_p95;
+                let a_total = a_user_p99 + a_kernel_p99;
+                let b_total = b_user_p99 + b_kernel_p99;
 
                 b_total.cmp(&a_total)
             });
