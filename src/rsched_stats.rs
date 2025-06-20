@@ -355,7 +355,7 @@ impl RschedStats {
                 "PROCS",
                 "p50",
                 "p90",
-                "p95",
+                "p99",
                 "COUNT",
                 width = max_comm_len
             );
@@ -366,7 +366,7 @@ impl RschedStats {
                 "COMMAND",
                 "p50",
                 "p90",
-                "p95",
+                "p99",
                 "COUNT",
                 width = max_comm_len
             );
@@ -380,7 +380,7 @@ impl RschedStats {
 
             let p50 = self.calculate_percentile(&entry.waking_delay_hist, 50);
             let p90 = self.calculate_percentile(&entry.waking_delay_hist, 90);
-            let p95 = self.calculate_percentile(&entry.waking_delay_hist, 95);
+            let p99 = self.calculate_percentile(&entry.waking_delay_hist, 99);
 
             if collapsed {
                 println!(
@@ -389,7 +389,7 @@ impl RschedStats {
                     entry.pids.len(),
                     p50,
                     p90,
-                    p95,
+                    p99,
                     total_count,
                     width = max_comm_len
                 );
@@ -400,7 +400,7 @@ impl RschedStats {
                     &entry.comm,
                     p50,
                     p90,
-                    p95,
+                    p99,
                     total_count,
                     width = max_comm_len
                 );
@@ -468,7 +468,7 @@ impl RschedStats {
                 "PROCS",
                 "p50",
                 "p90",
-                "p95",
+                "p99",
                 "COUNT",
                 width = max_comm_len
             );
@@ -479,7 +479,7 @@ impl RschedStats {
                 "COMMAND",
                 "p50",
                 "p90",
-                "p95",
+                "p99",
                 "COUNT",
                 width = max_comm_len
             );
@@ -493,7 +493,7 @@ impl RschedStats {
 
             let p50 = self.calculate_nr_running_percentile(&entry.nr_running_hist, 50);
             let p90 = self.calculate_nr_running_percentile(&entry.nr_running_hist, 90);
-            let p95 = self.calculate_nr_running_percentile(&entry.nr_running_hist, 95);
+            let p99 = self.calculate_nr_running_percentile(&entry.nr_running_hist, 99);
 
             if collapsed {
                 println!(
@@ -502,7 +502,7 @@ impl RschedStats {
                     entry.pids.len(),
                     p50,
                     p90,
-                    p95,
+                    p99,
                     total_count,
                     width = max_comm_len
                 );
@@ -513,7 +513,7 @@ impl RschedStats {
                     &entry.comm,
                     p50,
                     p90,
-                    p95,
+                    p99,
                     total_count,
                     width = max_comm_len
                 );
@@ -935,7 +935,7 @@ impl RschedStats {
                 "PROCS",
                 "p50",
                 "p90",
-                "p95",
+                "p99",
                 "COUNT",
                 "PIDs",
                 width = max_comm_len
@@ -947,7 +947,7 @@ impl RschedStats {
                 "COMMAND",
                 "p50",
                 "p90",
-                "p95",
+                "p99",
                 "COUNT",
                 width = max_comm_len
             );
@@ -957,7 +957,7 @@ impl RschedStats {
             let total_count = self.get_total_count(&entry.hist);
             let p50 = self.calculate_percentile(&entry.hist, 50);
             let p90 = self.calculate_percentile(&entry.hist, 90);
-            let p95 = self.calculate_percentile(&entry.hist, 95);
+            let p99 = self.calculate_percentile(&entry.hist, 99);
 
             if collapsed {
                 let pid_str = self.format_pid_list(&entry.pids);
@@ -967,7 +967,7 @@ impl RschedStats {
                     entry.pids.len(),
                     p50,
                     p90,
-                    p95,
+                    p99,
                     total_count,
                     pid_str,
                     width = max_comm_len
@@ -979,7 +979,7 @@ impl RschedStats {
                     &entry.comm,
                     p50,
                     p90,
-                    p95,
+                    p99,
                     total_count,
                     width = max_comm_len
                 );
@@ -1018,7 +1018,7 @@ impl RschedStats {
             // Detailed mode: show all CPUs
             println!(
                 "{:<8} {:<10} {:<10} {:<10} {:<12}",
-                "CPU", "p50", "p90", "p95", "COUNT"
+                "CPU", "p50", "p90", "p99", "COUNT"
             );
 
             let mut sorted_cpus = filtered_cpus;
@@ -1028,11 +1028,11 @@ impl RschedStats {
                 let total_count = self.get_total_count(hist);
                 let p50 = self.calculate_percentile(hist, 50);
                 let p90 = self.calculate_percentile(hist, 90);
-                let p95 = self.calculate_percentile(hist, 95);
+                let p99 = self.calculate_percentile(hist, 99);
 
                 println!(
                     "{:<8} {:<10} {:<10} {:<10} {:<12}",
-                    cpu, p50, p90, p95, total_count
+                    cpu, p50, p90, p99, total_count
                 );
             }
         } else {
@@ -1071,11 +1071,11 @@ impl RschedStats {
                 let total_count = self.get_total_count(&total_hist);
                 let p50 = self.calculate_percentile(&total_hist, 50);
                 let p90 = self.calculate_percentile(&total_hist, 90);
-                let p95 = self.calculate_percentile(&total_hist, 95);
+                let p99 = self.calculate_percentile(&total_hist, 99);
 
                 println!(
-                    "  Aggregate: p50={:<6} p90={:<6} p95={:<6} count={}\n",
-                    p50, p90, p95, total_count
+                    "  Aggregate: p50={:<6} p90={:<6} p99={:<6} count={}\n",
+                    p50, p90, p99, total_count
                 );
             }
         }
