@@ -74,6 +74,22 @@ struct {
 	__type(value, __u64);
 } oncpu_time SEC(".maps");
 
+// maps pid -> sleep start time from sched_switch tracepoint
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 10240);
+	__type(key, __u32);
+	__type(value, __u64);
+} sleep_time SEC(".maps");
+
+// maps cpu -> idle start time from sched_switch tracepoint
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} cpu_idle_time SEC(".maps");
+
 // histogram of scheduler delay (sched_wakeup -> sched_switch)
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -98,6 +114,14 @@ struct {
 	__type(value, struct timeslice_data);
 } timeslice_hists SEC(".maps");
 
+// histogram of sleep duration (sched_switch -> sched_wakeup)
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 10240);
+	__type(key, __u32);
+	__type(value, struct hist_data);
+} sleep_hists SEC(".maps");
+
 // histogram of scheduler delay per CPU (sched_wakeup -> sched_switch)
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -105,6 +129,14 @@ struct {
 	__type(key, __u32);
 	__type(value, struct hist);
 } cpu_hists SEC(".maps");
+
+// histogram of CPU idle duration per CPU
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_CPUS);
+	__type(key, __u32);
+	__type(value, struct hist);
+} cpu_idle_hists SEC(".maps");
 
 static struct hist zero;
 static struct timeslice_stats zero_ts;
@@ -235,6 +267,14 @@ static __always_inline __u64 read_kernel_instructions(void)
 		return val.counter;
 	return 0;
 }
+
+static __always_inline void record_sleep_start(__u32 pid, __u64 ts)
+{
+	if (pid) {
+		bpf_map_update_elem(&sleep_time, &pid, &ts, BPF_ANY);
+	}
+}
+
 static __always_inline void record_enqueue(__u32 pid, __u64 ts)
 {
 	if (pid) {
@@ -352,7 +392,7 @@ static __always_inline int handle_wakeup(struct task_struct *p)
 	struct rq *rq = bpf_get_rq_from_task(p);
 
 	if (!(rq && pid))
-		goto cleanup;
+		goto check_sleep;
 
 	struct nr_running_data *nr_data =
 		bpf_map_lookup_elem(&nr_running_hists, &pid);
@@ -362,7 +402,7 @@ static __always_inline int handle_wakeup(struct task_struct *p)
 				    BPF_NOEXIST);
 		nr_data = bpf_map_lookup_elem(&nr_running_hists, &pid);
 		if (!nr_data)
-			goto cleanup;
+			goto check_sleep;
 		read_task_comm(nr_data->comm, p);
 	}
 	nr_running = bpf_rq_nr_running(rq);
@@ -374,7 +414,45 @@ static __always_inline int handle_wakeup(struct task_struct *p)
 	if (slot < MAX_SLOTS)
 		__sync_fetch_and_add(&nr_data->hist.slots[slot], 1);
 
-cleanup:
+check_sleep:
+	// Handle sleep duration calculation
+	if (pid) {
+		__u64 *sleep_start = bpf_map_lookup_elem(&sleep_time, &pid);
+		if (sleep_start) {
+			__u64 sleep_duration = ts - *sleep_start;
+
+			// Skip if duration is unreasonably large (> 1 hour)
+			if (sleep_duration < 3600000000000ULL) {
+				struct hist_data *sleep_data =
+					bpf_map_lookup_elem(&sleep_hists, &pid);
+				if (!sleep_data) {
+					static struct hist_data new_data = {};
+					bpf_map_update_elem(&sleep_hists, &pid,
+							    &new_data,
+							    BPF_NOEXIST);
+					sleep_data = bpf_map_lookup_elem(
+						&sleep_hists, &pid);
+					if (sleep_data) {
+						read_task_comm(sleep_data->comm,
+							       p);
+					}
+				}
+
+				if (sleep_data) {
+					__u32 slot = hist_slot(sleep_duration);
+					if (slot < MAX_SLOTS) {
+						__sync_fetch_and_add(
+							&sleep_data->hist
+								 .slots[slot],
+							1);
+					}
+				}
+			}
+
+			bpf_map_delete_elem(&sleep_time, &pid);
+		}
+	}
+
 	record_enqueue(pid, ts);
 	return 0;
 }
@@ -441,14 +519,12 @@ static __always_inline void update_cpu_perf(__u32 prev_pid, __u32 next_pid,
 				read_task_comm(data->comm, prev);
 		}
 
-
 		// User cycles histogram
 		if (delta_user_cycles > 0) {
 			slot = log2_slot(delta_user_cycles);
 			if (slot < MAX_SLOTS)
 				__sync_fetch_and_add(
-					&data->data.user_cycles_hist
-							.slots[slot],
+					&data->data.user_cycles_hist.slots[slot],
 					1);
 		}
 
@@ -458,19 +534,19 @@ static __always_inline void update_cpu_perf(__u32 prev_pid, __u32 next_pid,
 			if (slot < MAX_SLOTS)
 				__sync_fetch_and_add(
 					&data->data.kernel_cycles_hist
-							.slots[slot],
+						 .slots[slot],
 					1);
 		}
 
 		// Also keep totals for IPC calculations
 		__sync_fetch_and_add(&data->data.total_user_cycles,
-					delta_user_cycles);
+				     delta_user_cycles);
 		__sync_fetch_and_add(&data->data.total_kernel_cycles,
-					delta_kernel_cycles);
+				     delta_kernel_cycles);
 		__sync_fetch_and_add(&data->data.total_user_instructions,
-					delta_user_inst);
+				     delta_user_inst);
 		__sync_fetch_and_add(&data->data.total_kernel_instructions,
-					delta_kernel_inst);
+				     delta_kernel_inst);
 		__sync_fetch_and_add(&data->data.sample_count, 1);
 	}
 out:
@@ -643,6 +719,46 @@ update_waking_delay(__u32 next_pid, struct task_struct *next, __u64 now)
 	}
 }
 
+static __always_inline void update_cpu_idle(__u32 cpu, __u64 now)
+{
+	__u32 zero = 0;
+	__u64 *idle_start = bpf_map_lookup_elem(&cpu_idle_time, &zero);
+
+	if (idle_start && *idle_start > 0) {
+		__u64 idle_duration = now - *idle_start;
+
+		// Skip if duration is unreasonably large > 1hr
+		if (idle_duration < 3600000000000ULL) {
+			struct hist *cpu_idle_hist =
+				bpf_map_lookup_elem(&cpu_idle_hists, &cpu);
+			if (!cpu_idle_hist) {
+				static struct hist new_hist = {};
+				bpf_map_update_elem(&cpu_idle_hists, &cpu,
+						    &new_hist, BPF_NOEXIST);
+				cpu_idle_hist = bpf_map_lookup_elem(
+					&cpu_idle_hists, &cpu);
+			}
+
+			if (cpu_idle_hist) {
+				__u32 slot = hist_slot(idle_duration);
+				if (slot < MAX_SLOTS) {
+					__sync_fetch_and_add(
+						&cpu_idle_hist->slots[slot], 1);
+				}
+			}
+		}
+
+		// Clear idle start time
+		*idle_start = 0;
+	}
+}
+
+static __always_inline void record_cpu_idle_start(__u32 cpu, __u64 ts)
+{
+	__u32 zero = 0;
+	bpf_map_update_elem(&cpu_idle_time, &zero, &ts, BPF_ANY);
+}
+
 static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
 					 struct task_struct *next)
 {
@@ -651,12 +767,25 @@ static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
 	__u64 now = bpf_ktime_get_ns();
 	__u64 delay;
 	int involuntary = 0;
+	__u32 cpu = bpf_get_smp_processor_id();
+
+	// Handle CPU idle tracking
+	if (prev_pid == 0 && next_pid != 0) {
+		// CPU was idle, now running a task
+		update_cpu_idle(cpu, now);
+	} else if (prev_pid != 0 && next_pid == 0) {
+		// CPU going idle
+		record_cpu_idle_start(cpu, now);
+	}
 
 	// Handle the previous task - if it's still runnable (preempted), record enqueue time
 	if (get_task_state(prev) == TASK_RUNNING) {
 		involuntary = 1;
 		record_enqueue(prev_pid, now);
 		record_waking(prev_pid, now);
+	} else if (prev_pid != 0) {
+		// Task is going to sleep
+		record_sleep_start(prev_pid, now);
 	}
 
 	// update the timeslice data for the previous task
@@ -689,7 +818,9 @@ static __always_inline int handle_exit(struct task_struct *p)
 		bpf_map_delete_elem(&waking_delay, &pid);
 	}
 	bpf_map_delete_elem(&oncpu_time, &pid);
+	bpf_map_delete_elem(&sleep_time, &pid);
 	bpf_map_delete_elem(&hists, &pid);
+	bpf_map_delete_elem(&sleep_hists, &pid);
 	bpf_map_delete_elem(&timeslice_hists, &pid);
 	bpf_map_delete_elem(&nr_running_hists, &pid);
 	bpf_map_delete_elem(&cpu_perf_stats, &pid);

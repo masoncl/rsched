@@ -222,6 +222,9 @@ fn main() -> Result<()> {
         let timeslice_stats = collector.collect_timeslice_stats()?;
         let nr_running_hists = collector.collect_nr_running_hists()?;
         let waking_delays = collector.collect_waking_delays()?;
+        let sleep_durations = collector.collect_sleep_durations()?;
+        let cpu_idle_histograms = collector.collect_cpu_idle_histograms()?;
+
         if let Some(ref mut schedstat) = schedstat_collector {
             let schedstat_data = schedstat.collect()?;
             stats.update_schedstat(schedstat_data);
@@ -237,6 +240,8 @@ fn main() -> Result<()> {
         stats.update_timeslices(timeslice_stats);
         stats.update_nr_running(nr_running_hists);
         stats.update_waking_delays(waking_delays);
+        stats.update_sleep_durations(sleep_durations);
+        stats.update_cpu_idle(cpu_idle_histograms);
 
         if let Some(ref mut metrics) = cpu_metrics {
             metrics.update(cpu_perf_data);

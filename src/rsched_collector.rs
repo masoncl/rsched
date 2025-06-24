@@ -115,9 +115,11 @@ unsafe impl Plain for CpuPerfDataFull {}
 pub struct RschedCollector<'a> {
     hists_map: &'a Map<'a>,
     cpu_hists_map: &'a Map<'a>,
+    cpu_idle_hists_map: &'a Map<'a>,
     timeslice_hists_map: &'a Map<'a>,
     nr_running_hists_map: &'a Map<'a>,
     waking_delay_map: &'a Map<'a>,
+    sleep_hists_map: &'a Map<'a>,
     cpu_perf_map: &'a Map<'a>,
 }
 
@@ -126,9 +128,11 @@ impl<'a> RschedCollector<'a> {
         Self {
             hists_map: &maps.hists,
             cpu_hists_map: &maps.cpu_hists,
+            cpu_idle_hists_map: &maps.cpu_idle_hists,
             timeslice_hists_map: &maps.timeslice_hists,
             nr_running_hists_map: &maps.nr_running_hists,
             waking_delay_map: &maps.waking_delay,
+            sleep_hists_map: &maps.sleep_hists,
             cpu_perf_map: &maps.cpu_perf_stats,
         }
     }
@@ -182,12 +186,20 @@ impl<'a> RschedCollector<'a> {
         self.collect_plain::<Hist>(self.cpu_hists_map)
     }
 
+    pub fn collect_cpu_idle_histograms(&mut self) -> Result<HashMap<u32, Hist>> {
+        self.collect_plain::<Hist>(self.cpu_idle_hists_map)
+    }
+
     pub fn collect_nr_running_hists(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
         self.collect_with_comm::<HistData, Hist>(self.nr_running_hists_map)
     }
 
     pub fn collect_waking_delays(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
         self.collect_with_comm::<HistData, Hist>(self.waking_delay_map)
+    }
+
+    pub fn collect_sleep_durations(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
+        self.collect_with_comm::<HistData, Hist>(self.sleep_hists_map)
     }
 
     pub fn collect_timeslice_stats(&mut self) -> Result<HashMap<u32, (TimesliceStats, String)>> {
