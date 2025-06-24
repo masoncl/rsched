@@ -152,6 +152,12 @@ fn main() -> Result<()> {
         None
     };
 
+    // get initial schedstat numbers if it is enabled
+    if let Some(ref mut schedstat) = schedstat_collector {
+            let schedstat_data = schedstat.collect()?;
+            stats.update_schedstat(schedstat_data);
+    }
+
     let output_mode = if args.detailed {
         OutputMode::Detailed
     } else if !args.no_collapse {
