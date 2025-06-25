@@ -208,7 +208,8 @@ impl CpuMetrics {
         filters: &CpuFilterOptions,
         _elapsed_secs: f64,
     ) -> Vec<CpuProcessEntry> {
-        if filters.collapsed {
+        // In detailed mode, always show individual processes (implies -C/no-collapse)
+        if filters.collapsed && !filters.detailed {
             // Collapse by command name
             let mut comm_map: HashMap<String, CpuProcessEntry> = HashMap::new();
 
@@ -317,7 +318,11 @@ impl CpuMetrics {
         collapsed: bool,
         elapsed_secs: f64,
     ) {
-        println!("\nDetailed CPU Performance by Process (cycles are per timeslice):\n");
+        println!("\nDetailed CPU Performance by Process (cycles are per timeslice):");
+        println!(
+            "(Showing all {} processes with CPU metrics)\n",
+            entries.len()
+        );
 
         // Sort by total cycles
         let mut sorted_entries = entries.to_vec();
@@ -327,6 +332,7 @@ impl CpuMetrics {
             b_total.cmp(&a_total)
         });
 
+        // In detailed mode, show ALL entries
         let entry_refs: Vec<&CpuProcessEntry> = sorted_entries.iter().collect();
         self.print_process_table(&entry_refs, collapsed, elapsed_secs);
     }
