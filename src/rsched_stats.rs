@@ -24,40 +24,36 @@ pub struct FilterOptions {
     pub trace_sched_waking: bool,
 }
 
+// Generic stats data structure to replace all the specific ones
+#[derive(Clone)]
+struct StatsData<T: Clone + Default> {
+    data: T,
+    comm: String,
+}
+
+impl<T: Clone + Default> Default for StatsData<T> {
+    fn default() -> Self {
+        Self {
+            data: T::default(),
+            comm: String::new(),
+        }
+    }
+}
+
+// Type aliases for clarity
+type HistogramStats = StatsData<Hist>;
+type TimesliceStatsData = StatsData<TimesliceStats>;
+
 pub struct RschedStats {
-    pid_stats: HashMap<u32, RschedPidStats>,
+    // Use generic StatsData for all histogram-based stats
+    pid_stats: HashMap<u32, HistogramStats>,
     cpu_stats: HashMap<u32, Hist>,
     cpu_idle_stats: HashMap<u32, Hist>,
     timeslice_stats: HashMap<u32, TimesliceStatsData>,
-    nr_running_stats: HashMap<u32, NrRunningData>,
-    waking_delay_stats: HashMap<u32, WakingDelayData>,
-    sleep_duration_stats: HashMap<u32, SleepDurationData>,
+    nr_running_stats: HashMap<u32, HistogramStats>,
+    waking_delay_stats: HashMap<u32, HistogramStats>,
+    sleep_duration_stats: HashMap<u32, HistogramStats>,
     schedstat_data: Option<SchedstatData>,
-}
-
-struct RschedPidStats {
-    hist: Hist,
-    comm: String,
-}
-
-struct TimesliceStatsData {
-    stats: TimesliceStats,
-    comm: String,
-}
-
-struct NrRunningData {
-    hist: Hist,
-    comm: String,
-}
-
-struct WakingDelayData {
-    hist: Hist,
-    comm: String,
-}
-
-struct SleepDurationData {
-    hist: Hist,
-    comm: String,
 }
 
 // Represents either a single process or a collapsed group of processes
@@ -71,6 +67,12 @@ struct ProcessEntry {
     pids: Vec<u32>,
 }
 
+// Trait for grouping by percentile
+trait PercentileGroup: Sized + Ord + Copy {
+    fn from_percentile(p90: u64) -> Self;
+    fn description(&self) -> &'static str;
+}
+
 // Latency groups for grouped output
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum LatencyGroup {
@@ -81,19 +83,14 @@ enum LatencyGroup {
     VeryHigh, // > 10 ms
 }
 
-impl LatencyGroup {
+impl PercentileGroup for LatencyGroup {
     fn from_percentile(p90: u64) -> Self {
-        // Classify based on p90
-        if p90 < 10 {
-            LatencyGroup::VeryLow
-        } else if p90 < 100 {
-            LatencyGroup::Low
-        } else if p90 < 1000 {
-            LatencyGroup::Medium
-        } else if p90 < 10000 {
-            LatencyGroup::High
-        } else {
-            LatencyGroup::VeryHigh
+        match p90 {
+            0..=9 => LatencyGroup::VeryLow,
+            10..=99 => LatencyGroup::Low,
+            100..=999 => LatencyGroup::Medium,
+            1000..=9999 => LatencyGroup::High,
+            _ => LatencyGroup::VeryHigh,
         }
     }
 
@@ -118,18 +115,14 @@ enum IdleDurationGroup {
     VeryLong,  // > 100ms
 }
 
-impl IdleDurationGroup {
+impl PercentileGroup for IdleDurationGroup {
     fn from_percentile(p90: u64) -> Self {
-        if p90 < 100 {
-            IdleDurationGroup::VeryShort
-        } else if p90 < 1000 {
-            IdleDurationGroup::Short
-        } else if p90 < 10000 {
-            IdleDurationGroup::Medium
-        } else if p90 < 100000 {
-            IdleDurationGroup::Long
-        } else {
-            IdleDurationGroup::VeryLong
+        match p90 {
+            0..=99 => IdleDurationGroup::VeryShort,
+            100..=999 => IdleDurationGroup::Short,
+            1000..=9999 => IdleDurationGroup::Medium,
+            10000..=99999 => IdleDurationGroup::Long,
+            _ => IdleDurationGroup::VeryLong,
         }
     }
 
@@ -141,6 +134,48 @@ impl IdleDurationGroup {
             IdleDurationGroup::Long => "Long (10-100ms)",
             IdleDurationGroup::VeryLong => "Very Long (>100ms)",
         }
+    }
+}
+
+// Generic table column definition
+struct TableColumn {
+    header: &'static str,
+    width: usize,
+}
+
+impl TableColumn {
+    fn new(header: &'static str, width: usize) -> Self {
+        Self { header, width }
+    }
+}
+
+// Histogram operations trait
+trait HistogramOps {
+    fn merge_into(&mut self, other: &Self);
+    fn total_count(&self) -> u64;
+}
+
+impl HistogramOps for Hist {
+    fn merge_into(&mut self, other: &Self) {
+        for i in 0..MAX_SLOTS {
+            self.slots[i] += other.slots[i];
+        }
+    }
+
+    fn total_count(&self) -> u64 {
+        self.slots.iter().map(|&count| count as u64).sum()
+    }
+}
+
+impl HistogramOps for TimesliceStats {
+    fn merge_into(&mut self, other: &Self) {
+        self.voluntary.merge_into(&other.voluntary);
+        self.involuntary.merge_into(&other.involuntary);
+        self.involuntary_count += other.involuntary_count;
+    }
+
+    fn total_count(&self) -> u64 {
+        self.voluntary.total_count() + self.involuntary.total_count()
     }
 }
 
@@ -158,43 +193,38 @@ impl RschedStats {
         }
     }
 
-    pub fn update(&mut self, histograms: HashMap<u32, (Hist, String)>) {
-        for (pid, (hist, comm)) in histograms {
-            let stats = self.pid_stats.entry(pid).or_insert(RschedPidStats {
-                hist: Hist::default(),
-                comm: comm.clone(),
-            });
+    // Generic update function for histogram-based stats
+    fn update_histogram_stats<T: HistogramOps + Clone + Default>(
+        stats_map: &mut HashMap<u32, StatsData<T>>,
+        updates: HashMap<u32, (T, String)>,
+    ) {
+        for (key, (data, comm)) in updates {
+            let stats = stats_map.entry(key).or_default();
 
             if stats.comm != comm {
                 stats.comm = comm;
             }
 
-            // Merge histograms
-            for i in 0..MAX_SLOTS {
-                stats.hist.slots[i] += hist.slots[i];
-            }
+            stats.data.merge_into(&data);
         }
+    }
+
+    pub fn update(&mut self, histograms: HashMap<u32, (Hist, String)>) {
+        Self::update_histogram_stats(&mut self.pid_stats, histograms);
     }
 
     pub fn update_cpu(&mut self, cpu_histograms: HashMap<u32, Hist>) {
         for (cpu, hist) in cpu_histograms {
-            let stats = self.cpu_stats.entry(cpu).or_insert(Hist::default());
-
-            // Merge histograms
-            for i in 0..MAX_SLOTS {
-                stats.slots[i] += hist.slots[i];
-            }
+            self.cpu_stats.entry(cpu).or_default().merge_into(&hist);
         }
     }
 
     pub fn update_cpu_idle(&mut self, cpu_idle_histograms: HashMap<u32, Hist>) {
         for (cpu, hist) in cpu_idle_histograms {
-            let stats = self.cpu_idle_stats.entry(cpu).or_insert(Hist::default());
-
-            // Merge histograms
-            for i in 0..MAX_SLOTS {
-                stats.slots[i] += hist.slots[i];
-            }
+            self.cpu_idle_stats
+                .entry(cpu)
+                .or_default()
+                .merge_into(&hist);
         }
     }
 
@@ -203,139 +233,19 @@ impl RschedStats {
     }
 
     pub fn update_timeslices(&mut self, timeslice_data: HashMap<u32, (TimesliceStats, String)>) {
-        for (pid, (new_stats, comm)) in timeslice_data {
-            let stats = self
-                .timeslice_stats
-                .entry(pid)
-                .or_insert(TimesliceStatsData {
-                    stats: TimesliceStats::default(),
-                    comm: comm.clone(),
-                });
-
-            if stats.comm != comm {
-                stats.comm = comm;
-            }
-
-            // Merge timeslice histograms
-            for i in 0..MAX_SLOTS {
-                stats.stats.voluntary.slots[i] += new_stats.voluntary.slots[i];
-                stats.stats.involuntary.slots[i] += new_stats.involuntary.slots[i];
-            }
-            stats.stats.involuntary_count += new_stats.involuntary_count;
-        }
+        Self::update_histogram_stats(&mut self.timeslice_stats, timeslice_data);
     }
 
     pub fn update_nr_running(&mut self, nr_running_data: HashMap<u32, (Hist, String)>) {
-        for (pid, (hist, comm)) in nr_running_data {
-            let stats = self.nr_running_stats.entry(pid).or_insert(NrRunningData {
-                hist: Hist::default(),
-                comm: comm.clone(),
-            });
-
-            // Merge histograms
-            for i in 0..MAX_SLOTS {
-                stats.hist.slots[i] += hist.slots[i];
-            }
-        }
+        Self::update_histogram_stats(&mut self.nr_running_stats, nr_running_data);
     }
 
     pub fn update_waking_delays(&mut self, waking_delays: HashMap<u32, (Hist, String)>) {
-        for (pid, (hist, comm)) in waking_delays {
-            let stats = self
-                .waking_delay_stats
-                .entry(pid)
-                .or_insert(WakingDelayData {
-                    hist: Hist::default(),
-                    comm: comm.clone(),
-                });
-
-            // Merge histograms
-            for i in 0..MAX_SLOTS {
-                stats.hist.slots[i] += hist.slots[i];
-            }
-        }
+        Self::update_histogram_stats(&mut self.waking_delay_stats, waking_delays);
     }
 
     pub fn update_sleep_durations(&mut self, sleep_durations: HashMap<u32, (Hist, String)>) {
-        for (pid, (hist, comm)) in sleep_durations {
-            let stats = self
-                .sleep_duration_stats
-                .entry(pid)
-                .or_insert(SleepDurationData {
-                    hist: Hist::default(),
-                    comm: comm.clone(),
-                });
-
-            if stats.comm != comm {
-                stats.comm = comm;
-            }
-
-            // Merge histograms
-            for i in 0..MAX_SLOTS {
-                stats.hist.slots[i] += hist.slots[i];
-            }
-        }
-    }
-
-    pub fn print_schedstat(&self, schedstat_data: &SchedstatData) {
-        // Print schedstat metrics in 3 columns
-        println!("\n=== System-wide Schedstat Metrics (deltas) ===");
-
-        // Collect all metrics into a sorted vector
-        let mut metrics: Vec<(&String, &u64)> = schedstat_data.domain_totals.iter().collect();
-        metrics.sort_by(|a, b| a.0.cmp(b.0));
-
-        // Print in 3 columns
-        let metrics_per_col = (metrics.len() + 2) / 3;
-
-        for row in 0..metrics_per_col {
-            for col in 0..3 {
-                let idx = col * metrics_per_col + row;
-                if idx < metrics.len() {
-                    let (name, value) = metrics[idx];
-                    print!("{:<30} {:>9} ", name, value);
-                    if col < 2 {
-                        print!("| ");
-                    }
-                }
-            }
-            println!();
-        }
-
-        // Also print CPU field totals
-        if !schedstat_data.cpu_totals.is_empty() {
-            println!("\n=== CPU Field Totals (deltas) ===");
-            let cpu_fields = vec![
-                "yld_count",
-                "sched_count",
-                "sched_goidle",
-                "ttwu_count",
-                "ttwu_local",
-                "rq_cpu_time",
-                "rq_run_delay usec",
-                "rq_pcount",
-            ];
-
-            for (i, field) in cpu_fields.iter().enumerate() {
-                if i < schedstat_data.cpu_totals.len() {
-                    let mut val = schedstat_data.cpu_totals[i];
-                    if *field == "rq_run_delay usec" {
-                        val = val / schedstat_data.cpu_totals[i + 1];
-                    }
-                    print!("{:<17} {:>12} ", field, val);
-                    if (i + 1) % 3 == 0 {
-                        println!();
-                    } else {
-                        print!("| ");
-                    }
-                }
-            }
-            if cpu_fields.len() % 3 != 0 {
-                println!();
-            }
-        }
-
-        println!();
+        Self::update_histogram_stats(&mut self.sleep_duration_stats, sleep_durations);
     }
 
     pub fn print_summary(&self, mode: OutputMode, filters: &FilterOptions) -> Result<()> {
@@ -353,98 +263,125 @@ impl RschedStats {
         if process_entries.is_empty() {
             println!("No processes match the specified filters.\n");
         } else {
-            self.print_process_stats(&process_entries, detailed, collapsed)?;
-            println!();
+            // Print each metric type
+            self.print_metric_section(
+                &process_entries,
+                "Scheduling Delays",
+                "(microseconds)",
+                |e| &e.hist,
+                |s, h| s.calculate_percentile(h, 90),
+                detailed,
+                collapsed,
+            )?;
 
             if filters.trace_sched_waking {
-                self.print_waking_delay_stats(&process_entries, detailed, collapsed)?;
-                println!();
+                self.print_metric_section(
+                    &process_entries,
+                    "Waking Delay Statistics",
+                    "(Time from sched_waking to sched_switch)",
+                    |e| &e.waking_delay_hist,
+                    |s, h| s.calculate_percentile(h, 90),
+                    detailed,
+                    collapsed,
+                )?;
             }
 
             self.print_timeslice_stats(&process_entries, detailed, collapsed)?;
             println!();
-            self.print_sleep_duration_stats(&process_entries, detailed, collapsed)?;
-            println!();
+
+            self.print_metric_section(
+                &process_entries,
+                "Sleep Duration Statistics",
+                "(Time spent sleeping between sched_switch and sched_wakeup)",
+                |e| &e.sleep_duration_hist,
+                |s, h| s.calculate_percentile(h, 90),
+                detailed,
+                collapsed,
+            )?;
+
             self.print_nr_running_stats(&process_entries, detailed, collapsed)?;
         }
+
         if let Some(data) = &self.schedstat_data {
             self.print_schedstat(data);
         }
 
         // Print CPU stats
         self.print_cpu_stats(filters, detailed)?;
-
-        // Print CPU idle stats
         self.print_cpu_idle_stats(filters, detailed)?;
 
         Ok(())
     }
 
-    fn print_sleep_duration_stats(
+    // Generic function to print histogram-based metrics
+    fn print_metric_section<F, S>(
         &self,
         entries: &[ProcessEntry],
+        title: &str,
+        subtitle: &str,
+        hist_getter: F,
+        sort_key: S,
         detailed: bool,
         collapsed: bool,
-    ) -> Result<()> {
-        let title = if collapsed {
-            "Collapsed Sleep Duration Statistics"
+    ) -> Result<()>
+    where
+        F: Fn(&ProcessEntry) -> &Hist + Copy,
+        S: Fn(&Self, &Hist) -> u64 + Copy,
+    {
+        let title_prefix = if collapsed {
+            "Collapsed"
         } else {
-            "Per-Process Sleep Duration Statistics"
+            "Per-Process"
         };
+        println!("=== {} {} {} ===", title_prefix, title, subtitle);
+        if !subtitle.is_empty() {
+            println!();
+        }
 
-        println!("=== {} (microseconds) ===", title);
-        println!("(Time spent sleeping between sched_switch and sched_wakeup)\n");
-
-        // Filter out entries with no sleep data
-        let entries_with_sleep: Vec<&ProcessEntry> = entries
+        // Filter entries with data
+        let entries_with_data: Vec<&ProcessEntry> = entries
             .iter()
-            .filter(|e| self.get_total_count(&e.sleep_duration_hist) > 0)
+            .filter(|e| hist_getter(e).total_count() > 0)
             .collect();
 
-        if entries_with_sleep.is_empty() {
-            println!("No sleep duration data collected yet.\n");
+        if entries_with_data.is_empty() {
+            println!("No {} data collected yet.\n", title.to_lowercase());
             return Ok(());
         }
 
         if detailed {
-            // Detailed mode: show all entries with sleep data
-            self.print_sleep_duration_table(&entries_with_sleep, collapsed);
+            self.print_histogram_table(&entries_with_data, hist_getter, collapsed);
         } else {
-            // Grouped mode: group by sleep duration ranges
-            let mut sleep_groups: HashMap<LatencyGroup, Vec<&ProcessEntry>> = HashMap::new();
+            // Group by latency
+            let mut groups: HashMap<LatencyGroup, Vec<&ProcessEntry>> = HashMap::new();
 
-            for entry in &entries_with_sleep {
-                let p90 = self.calculate_percentile(&entry.sleep_duration_hist, 90);
+            for entry in &entries_with_data {
+                let p90 = self.calculate_percentile(hist_getter(entry), 90);
                 let group = LatencyGroup::from_percentile(p90);
-                sleep_groups
-                    .entry(group)
-                    .or_insert_with(Vec::new)
-                    .push(entry);
+                groups.entry(group).or_default().push(entry);
             }
 
-            let mut groups: Vec<_> = sleep_groups.iter().collect();
-            groups.sort_by_key(|(group, _)| *group);
+            let mut sorted_groups: Vec<_> = groups.into_iter().collect();
+            sorted_groups.sort_by_key(|(group, _)| *group);
 
-            for (group, group_entries) in groups {
+            for (group, mut group_entries) in sorted_groups {
                 println!("{} ({} entries):", group.description(), group_entries.len());
 
-                // Sort by p90 descending
-                let mut sorted_entries = group_entries.clone();
-                sorted_entries.sort_by(|a, b| {
-                    let p90_a = self.calculate_percentile(&a.sleep_duration_hist, 90);
-                    let p90_b = self.calculate_percentile(&b.sleep_duration_hist, 90);
-                    p90_b.cmp(&p90_a)
+                // Sort by sort_key descending
+                group_entries.sort_by(|a, b| {
+                    let val_a = sort_key(self, hist_getter(a));
+                    let val_b = sort_key(self, hist_getter(b));
+                    val_b.cmp(&val_a)
                 });
 
-                // Show top 10 by p90
-                let show_count = sorted_entries.len().min(10);
+                let show_count = group_entries.len().min(10);
                 let table_entries: Vec<&ProcessEntry> =
-                    sorted_entries.iter().take(show_count).copied().collect();
+                    group_entries.iter().take(show_count).copied().collect();
 
-                self.print_sleep_duration_table(&table_entries, collapsed);
+                self.print_histogram_table(&table_entries, hist_getter, collapsed);
 
-                if sorted_entries.len() > show_count {
-                    println!("  ... and {} more\n", sorted_entries.len() - show_count);
+                if group_entries.len() > show_count {
+                    println!("  ... and {} more\n", group_entries.len() - show_count);
                 } else {
                     println!();
                 }
@@ -453,8 +390,12 @@ impl RschedStats {
 
         Ok(())
     }
-    fn print_sleep_duration_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
-        // Calculate the maximum command name length
+
+    // Generic histogram table printer
+    fn print_histogram_table<F>(&self, entries: &[&ProcessEntry], hist_getter: F, collapsed: bool)
+    where
+        F: Fn(&ProcessEntry) -> &Hist,
+    {
         let max_comm_len = entries
             .iter()
             .map(|e| e.comm.len())
@@ -462,315 +403,105 @@ impl RschedStats {
             .unwrap_or(7)
             .max(7);
 
-        if collapsed {
-            println!(
-                "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
-                "COMMAND",
-                "PROCS",
-                "p50",
-                "p90",
-                "p99",
-                "COUNT",
-                width = max_comm_len
-            );
+        // Define columns
+        let columns = if collapsed {
+            vec![
+                TableColumn::new("COMMAND", max_comm_len),
+                TableColumn::new("PROCS", 8),
+                TableColumn::new("p50", 10),
+                TableColumn::new("p90", 10),
+                TableColumn::new("p99", 10),
+                TableColumn::new("COUNT", 12),
+                TableColumn::new("PIDs", 20),
+            ]
         } else {
-            println!(
-                "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                "PID",
-                "COMMAND",
-                "p50",
-                "p90",
-                "p99",
-                "COUNT",
-                width = max_comm_len
-            );
-        }
+            vec![
+                TableColumn::new("PID", 8),
+                TableColumn::new("COMMAND", max_comm_len),
+                TableColumn::new("p50", 10),
+                TableColumn::new("p90", 10),
+                TableColumn::new("p99", 10),
+                TableColumn::new("COUNT", 12),
+            ]
+        };
 
+        // Print header
+        print!("  ");
+        for col in &columns {
+            print!("{:<width$} ", col.header, width = col.width);
+        }
+        println!();
+
+        // Print rows
         for entry in entries {
-            let total_count = self.get_total_count(&entry.sleep_duration_hist);
+            let hist = hist_getter(entry);
+            let total_count = hist.total_count();
+
             if total_count == 0 {
                 continue;
             }
 
-            let p50 = self.calculate_percentile(&entry.sleep_duration_hist, 50);
-            let p90 = self.calculate_percentile(&entry.sleep_duration_hist, 90);
-            let p99 = self.calculate_percentile(&entry.sleep_duration_hist, 99);
+            let p50 = self.calculate_percentile(hist, 50);
+            let p90 = self.calculate_percentile(hist, 90);
+            let p99 = self.calculate_percentile(hist, 99);
 
+            print!("  ");
             if collapsed {
+                print!("{:<width$} ", &entry.comm, width = columns[0].width);
+                print!("{:<width$} ", entry.pids.len(), width = columns[1].width);
+                print!("{:<width$} ", p50, width = columns[2].width);
+                print!("{:<width$} ", p90, width = columns[3].width);
+                print!("{:<width$} ", p99, width = columns[4].width);
+                print!("{:<width$} ", total_count, width = columns[5].width);
                 println!(
-                    "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
-                    &entry.comm,
-                    entry.pids.len(),
-                    p50,
-                    p90,
-                    p99,
-                    total_count,
-                    width = max_comm_len
+                    "{:<width$}",
+                    self.format_pid_list(&entry.pids),
+                    width = columns[6].width
                 );
             } else {
-                println!(
-                    "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                    entry.pids[0],
-                    &entry.comm,
-                    p50,
-                    p90,
-                    p99,
-                    total_count,
-                    width = max_comm_len
-                );
+                print!("{:<width$} ", entry.pids[0], width = columns[0].width);
+                print!("{:<width$} ", &entry.comm, width = columns[1].width);
+                print!("{:<width$} ", p50, width = columns[2].width);
+                print!("{:<width$} ", p90, width = columns[3].width);
+                print!("{:<width$} ", p99, width = columns[4].width);
+                println!("{:<width$}", total_count, width = columns[5].width);
             }
         }
     }
 
-    fn print_cpu_idle_stats(&self, _filters: &FilterOptions, detailed: bool) -> Result<()> {
-        let filtered_cpus: Vec<(u32, &Hist)> = self
-            .cpu_idle_stats
-            .iter()
-            .filter(|(_, hist)| {
-                let total_count = self.get_total_count(hist);
-                total_count > 0
-            })
-            .map(|(cpu, hist)| (*cpu, hist))
-            .collect();
-
-        if filtered_cpus.is_empty() {
-            println!("\n=== Per-CPU Idle Duration (microseconds) ===");
-            println!("No CPU idle data collected yet.\n");
-            return Ok(());
-        }
-
-        println!("\n=== Per-CPU Idle Duration (microseconds) ===\n");
-
-        if detailed {
-            // Detailed mode: show all CPUs
-            println!(
-                "{:<8} {:<10} {:<10} {:<10} {:<12}",
-                "CPU", "p50", "p90", "p99", "COUNT"
-            );
-
-            let mut sorted_cpus = filtered_cpus;
-            sorted_cpus.sort_by_key(|(cpu, _)| *cpu);
-
-            for (cpu, hist) in sorted_cpus {
-                let total_count = self.get_total_count(hist);
-                let p50 = self.calculate_percentile(hist, 50);
-                let p90 = self.calculate_percentile(hist, 90);
-                let p99 = self.calculate_percentile(hist, 99);
-
-                println!(
-                    "{:<8} {:<10} {:<10} {:<10} {:<12}",
-                    cpu, p50, p90, p99, total_count
-                );
-            }
-        } else {
-            // Grouped mode: group CPUs by idle duration
-            let mut cpu_groups: HashMap<IdleDurationGroup, Vec<u32>> = HashMap::new();
-
-            for (cpu, hist) in filtered_cpus {
-                let p90 = self.calculate_percentile(hist, 90);
-                let group = IdleDurationGroup::from_percentile(p90);
-                cpu_groups.entry(group).or_insert_with(Vec::new).push(cpu);
-            }
-
-            let mut groups: Vec<_> = cpu_groups.iter().collect();
-            groups.sort_by_key(|(group, _)| *group);
-
-            for (group, cpus) in groups {
-                let mut sorted_cpus = cpus.clone();
-                sorted_cpus.sort();
-
-                println!(
-                    "{}: CPUs {}",
-                    group.description(),
-                    format_cpu_list(&sorted_cpus)
-                );
-
-                // Show aggregate stats for this CPU group
-                let mut total_hist = Hist::default();
-                for cpu in &sorted_cpus {
-                    if let Some(hist) = self.cpu_idle_stats.get(cpu) {
-                        for i in 0..MAX_SLOTS {
-                            total_hist.slots[i] += hist.slots[i];
-                        }
-                    }
-                }
-
-                let total_count = self.get_total_count(&total_hist);
-                let p50 = self.calculate_percentile(&total_hist, 50);
-                let p90 = self.calculate_percentile(&total_hist, 90);
-                let p99 = self.calculate_percentile(&total_hist, 99);
-
-                println!(
-                    "  Aggregate: p50={:<6} p90={:<6} p99={:<6} count={}\n",
-                    p50, p90, p99, total_count
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    fn build_process_entries(&self, filters: &FilterOptions, collapse: bool) -> Vec<ProcessEntry> {
-        if collapse {
-            // Collapse by command name
-            let mut comm_map: HashMap<String, ProcessEntry> = HashMap::new();
-
-            // Process scheduling latency data
-            for (pid, stats) in &self.pid_stats {
-                if !self.should_include_process(pid, &stats.comm, filters) {
-                    continue;
-                }
-
-                let total_count = self.get_total_count(&stats.hist);
-                if total_count == 0 {
-                    continue;
-                }
-
-                let entry = comm_map.entry(stats.comm.clone()).or_insert(ProcessEntry {
-                    comm: stats.comm.clone(),
-                    hist: Hist::default(),
-                    timeslice_stats: TimesliceStats::default(),
-                    nr_running_hist: Hist::default(),
-                    waking_delay_hist: Hist::default(),
-                    sleep_duration_hist: Hist::default(),
-                    pids: Vec::new(),
-                });
-
-                // Merge histogram
-                for i in 0..MAX_SLOTS {
-                    entry.hist.slots[i] += stats.hist.slots[i];
-                }
-                entry.pids.push(*pid);
-            }
-
-            // Add timeslice data
-            for (_pid, ts_data) in &self.timeslice_stats {
-                if let Some(entry) = comm_map.get_mut(&ts_data.comm) {
-                    // Merge timeslice stats
-                    for i in 0..MAX_SLOTS {
-                        entry.timeslice_stats.voluntary.slots[i] +=
-                            ts_data.stats.voluntary.slots[i];
-                        entry.timeslice_stats.involuntary.slots[i] +=
-                            ts_data.stats.involuntary.slots[i];
-                    }
-                    entry.timeslice_stats.involuntary_count += ts_data.stats.involuntary_count;
-                }
-            }
-
-            // Add nr_running data
-            for (_pid, nr_data) in &self.nr_running_stats {
-                if let Some(entry) = comm_map.get_mut(&nr_data.comm) {
-                    // Merge nr_running histogram
-                    for i in 0..MAX_SLOTS {
-                        entry.nr_running_hist.slots[i] += nr_data.hist.slots[i];
-                    }
-                }
-            }
-
-            // Add waking delay data
-            for (_pid, wd_data) in &self.waking_delay_stats {
-                if let Some(entry) = comm_map.get_mut(&wd_data.comm) {
-                    // Merge waking delay histogram
-                    for i in 0..MAX_SLOTS {
-                        entry.waking_delay_hist.slots[i] += wd_data.hist.slots[i];
-                    }
-                }
-            }
-
-            // Add sleep duration data
-            for (_pid, sd_data) in &self.sleep_duration_stats {
-                if let Some(entry) = comm_map.get_mut(&sd_data.comm) {
-                    // Merge sleep duration histogram
-                    for i in 0..MAX_SLOTS {
-                        entry.sleep_duration_hist.slots[i] += sd_data.hist.slots[i];
-                    }
-                }
-            }
-
-            comm_map.into_values().collect()
-        } else {
-            // Individual processes
-            self.pid_stats
-                .iter()
-                .filter(|(pid, stats)| {
-                    self.should_include_process(pid, &stats.comm, filters)
-                        && self.get_total_count(&stats.hist) > 0
-                })
-                .map(|(pid, stats)| {
-                    let ts_stats = self
-                        .timeslice_stats
-                        .get(pid)
-                        .map(|ts| ts.stats.clone())
-                        .unwrap_or_default();
-
-                    let nr_hist = self
-                        .nr_running_stats
-                        .get(pid)
-                        .map(|nr| nr.hist.clone())
-                        .unwrap_or_default();
-
-                    let waking_delay_hist = self
-                        .waking_delay_stats
-                        .get(pid)
-                        .map(|wd| wd.hist.clone())
-                        .unwrap_or_default();
-
-                    let sleep_duration_hist = self
-                        .sleep_duration_stats
-                        .get(pid)
-                        .map(|sd| sd.hist.clone())
-                        .unwrap_or_default();
-
-                    ProcessEntry {
-                        comm: stats.comm.clone(),
-                        hist: stats.hist.clone(),
-                        timeslice_stats: ts_stats,
-                        nr_running_hist: nr_hist,
-                        waking_delay_hist,
-                        sleep_duration_hist,
-                        pids: vec![*pid],
-                    }
-                })
-                .collect()
-        }
-    }
-
-    fn print_waking_delay_stats(
+    // Keep specialized functions only where the generic approach doesn't work well
+    fn print_timeslice_stats(
         &self,
         entries: &[ProcessEntry],
         detailed: bool,
         collapsed: bool,
     ) -> Result<()> {
         let title = if collapsed {
-            "Collapsed Waking Delay Statistics"
+            "Collapsed Time Slice Statistics"
         } else {
-            "Per-Process Waking Delay Statistics"
+            "Per-Process Time Slice Statistics"
         };
 
-        println!("=== {} (microseconds) ===", title);
-        println!("(Time from sched_waking to sched_switch)\n");
+        println!("=== {} (microseconds) ===\n", title);
 
         if detailed {
-            // Detailed mode: show all entries
             let entry_refs: Vec<&ProcessEntry> = entries.iter().collect();
-            self.print_waking_delay_table(&entry_refs, collapsed);
+            self.print_timeslice_table(&entry_refs, collapsed);
         } else {
-            // Grouped mode: show top entries by p90 waking delay
-            println!("Processes by waking delay:\n");
+            println!("Time slice statistics grouped by preemption rate:\n");
 
-            // Sort by p90 waking delay
             let mut sorted_entries: Vec<&ProcessEntry> = entries.iter().collect();
             sorted_entries.sort_by(|a, b| {
-                let a_p90 = self.calculate_percentile(&a.waking_delay_hist, 90);
-                let b_p90 = self.calculate_percentile(&b.waking_delay_hist, 90);
-                b_p90.cmp(&a_p90)
+                let a_rate = self.calculate_preemption_rate(&a.timeslice_stats);
+                let b_rate = self.calculate_preemption_rate(&b.timeslice_stats);
+                b_rate.partial_cmp(&a_rate).unwrap()
             });
 
             let show_count = sorted_entries.len().min(10);
             let table_entries: Vec<&ProcessEntry> =
                 sorted_entries.iter().take(show_count).copied().collect();
 
-            self.print_waking_delay_table(&table_entries, collapsed);
+            self.print_timeslice_table(&table_entries, collapsed);
 
             if sorted_entries.len() > show_count {
                 println!("  ... and {} more\n", sorted_entries.len() - show_count);
@@ -780,8 +511,16 @@ impl RschedStats {
         Ok(())
     }
 
-    fn print_waking_delay_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
-        // Calculate the maximum command name length
+    fn calculate_preemption_rate(&self, stats: &TimesliceStats) -> f64 {
+        let total = stats.total_count();
+        if total > 0 && stats.involuntary_count > 0 {
+            stats.involuntary_count as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn print_timeslice_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
         let max_comm_len = entries
             .iter()
             .map(|e| e.comm.len())
@@ -791,58 +530,75 @@ impl RschedStats {
 
         if collapsed {
             println!(
-                "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
+                "  {:<width$} {:<8} {:<12} {:<20} {:<20} {:<12}",
                 "COMMAND",
                 "PROCS",
-                "p50",
-                "p90",
-                "p99",
-                "COUNT",
+                "INVOL_COUNT",
+                "VOLUNTARY(p50/p90)",
+                "PREEMPTED(p50/p90)",
+                "PREEMPT%",
                 width = max_comm_len
             );
         } else {
             println!(
-                "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
+                "  {:<8} {:<width$} {:<12} {:<20} {:<20} {:<12}",
                 "PID",
                 "COMMAND",
-                "p50",
-                "p90",
-                "p99",
-                "COUNT",
+                "INVOL_COUNT",
+                "VOLUNTARY(p50/p90)",
+                "PREEMPTED(p50/p90)",
+                "PREEMPT%",
                 width = max_comm_len
             );
         }
 
         for entry in entries {
-            let total_count = self.get_total_count(&entry.waking_delay_hist);
-            if total_count == 0 {
-                continue;
-            }
+            let vol_count = entry.timeslice_stats.voluntary.total_count();
+            let invol_count = entry.timeslice_stats.involuntary.total_count();
+            let total = vol_count + invol_count;
 
-            let p50 = self.calculate_percentile(&entry.waking_delay_hist, 50);
-            let p90 = self.calculate_percentile(&entry.waking_delay_hist, 90);
-            let p99 = self.calculate_percentile(&entry.waking_delay_hist, 99);
+            let vol_str = if vol_count > 0 {
+                let p50 = self.calculate_percentile(&entry.timeslice_stats.voluntary, 50);
+                let p90 = self.calculate_percentile(&entry.timeslice_stats.voluntary, 90);
+                format!("{}/{}", p50, p90)
+            } else {
+                "-".to_string()
+            };
+
+            let invol_str = if invol_count > 0 {
+                let p50 = self.calculate_percentile(&entry.timeslice_stats.involuntary, 50);
+                let p90 = self.calculate_percentile(&entry.timeslice_stats.involuntary, 90);
+                format!("{}/{}", p50, p90)
+            } else {
+                "-".to_string()
+            };
+
+            let preempt_pct = if total > 0 {
+                (entry.timeslice_stats.involuntary_count as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
 
             if collapsed {
                 println!(
-                    "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
+                    "  {:<width$} {:<8} {:<12} {:<20} {:<20} {:<12.1}%",
                     &entry.comm,
                     entry.pids.len(),
-                    p50,
-                    p90,
-                    p99,
-                    total_count,
+                    entry.timeslice_stats.involuntary_count,
+                    vol_str,
+                    invol_str,
+                    preempt_pct,
                     width = max_comm_len
                 );
             } else {
                 println!(
-                    "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
+                    "  {:<8} {:<width$} {:<12} {:<20} {:<20} {:<12.1}%",
                     entry.pids[0],
                     &entry.comm,
-                    p50,
-                    p90,
-                    p99,
-                    total_count,
+                    entry.timeslice_stats.involuntary_count,
+                    vol_str,
+                    invol_str,
+                    preempt_pct,
                     width = max_comm_len
                 );
             }
@@ -863,16 +619,22 @@ impl RschedStats {
 
         println!("=== {} (nr_running at wakeup) ===\n", title);
 
+        let entries_with_data: Vec<&ProcessEntry> = entries
+            .iter()
+            .filter(|e| e.nr_running_hist.total_count() > 0)
+            .collect();
+
+        if entries_with_data.is_empty() {
+            println!("No runqueue depth data collected yet.\n");
+            return Ok(());
+        }
+
         if detailed {
-            // Detailed mode: show all entries
-            let entry_refs: Vec<&ProcessEntry> = entries.iter().collect();
-            self.print_nr_running_table(&entry_refs, collapsed);
+            self.print_nr_running_table(&entries_with_data, collapsed);
         } else {
-            // Grouped mode: show top entries by p90 nr_running
             println!("Processes by runqueue depth at wakeup:\n");
 
-            // Sort by p90 nr_running
-            let mut sorted_entries: Vec<&ProcessEntry> = entries.iter().collect();
+            let mut sorted_entries = entries_with_data;
             sorted_entries.sort_by(|a, b| {
                 let a_p90 = self.calculate_nr_running_percentile(&a.nr_running_hist, 90);
                 let b_p90 = self.calculate_nr_running_percentile(&b.nr_running_hist, 90);
@@ -894,7 +656,7 @@ impl RschedStats {
     }
 
     fn print_nr_running_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
-        // Calculate the maximum command name length
+        // Use the generic histogram table printer with nr_running percentile calculation
         let max_comm_len = entries
             .iter()
             .map(|e| e.comm.len())
@@ -902,6 +664,7 @@ impl RschedStats {
             .unwrap_or(7)
             .max(7);
 
+        // Print header
         if collapsed {
             println!(
                 "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
@@ -926,8 +689,9 @@ impl RschedStats {
             );
         }
 
+        // Print rows with nr_running specific percentile calculation
         for entry in entries {
-            let total_count = self.get_total_count(&entry.nr_running_hist);
+            let total_count = entry.nr_running_hist.total_count();
             if total_count == 0 {
                 continue;
             }
@@ -962,377 +726,43 @@ impl RschedStats {
         }
     }
 
-    // Update calculate_nr_running_percentile to use all 64 slots
-    fn calculate_nr_running_percentile(&self, hist: &Hist, percentile: u8) -> u32 {
-        let total_count = self.get_total_count(hist);
-        if total_count == 0 {
-            return 0;
-        }
-
-        let target_count = (total_count * percentile as u64) / 100;
-        let mut cumulative_count = 0u64;
-
-        for (slot, &count) in hist.slots.iter().enumerate() {
-            cumulative_count += count as u64;
-
-            if cumulative_count >= target_count {
-                // For nr_running, slots directly represent task counts
-                // With 64 slots, we can represent 0-63 tasks directly
-                return slot as u32;
-            }
-        }
-
-        // If we get here, return the max slot value
-        63
-    }
-
-    fn calculate_percentile(&self, hist: &Hist, percentile: u8) -> u64 {
-        let total_count = self.get_total_count(hist);
-        if total_count == 0 {
-            return 0;
-        }
-
-        let target_count = (total_count * percentile as u64) / 100;
-        let mut cumulative_count = 0u64;
-
-        for (slot, &count) in hist.slots.iter().enumerate() {
-            let prev_cumulative = cumulative_count;
-            cumulative_count += count as u64;
-
-            if cumulative_count >= target_count {
-                // Calculate position within this bucket for interpolation
-                let count_in_bucket = count as u64;
-                let position_in_bucket = target_count - prev_cumulative;
-                let fraction = if count_in_bucket > 0 {
-                    position_in_bucket as f64 / count_in_bucket as f64
-                } else {
-                    0.5
-                };
-
-                // Determine the range for this slot
-                let (lower_bound, upper_bound) = self.get_slot_range(slot);
-
-                // Interpolate within the range
-                // Add 1 because both bounds are inclusive
-                let range = upper_bound - lower_bound + 1;
-                return lower_bound + (fraction * range as f64) as u64;
-            }
-        }
-
-        // If we get here, return a large value
-        1u64 << 27 // ~134 seconds
-    }
-
-    // Helper function to get the microsecond range for a histogram slot
-    fn get_slot_range(&self, slot: usize) -> (u64, u64) {
-        if slot < LINEAR_SLOTS {
-            // Linear buckets: each slot covers LINEAR_STEP microseconds
-            let lower = slot as u64 * LINEAR_STEP;
-            let upper = lower + LINEAR_STEP - 1;
-            (lower, upper)
-        } else if slot == LINEAR_SLOTS {
-            // Special transition slot for 500-511μs
-            (500, 511)
-        } else {
-            // Log2 buckets: slot 51 starts at 512μs (2^9)
-            // slot 52 = 1024μs (2^10), slot 53 = 2048μs (2^11), etc.
-            let log2_val = (slot - LINEAR_SLOTS - 1) + 9;
-            let lower = 1u64 << log2_val;
-            let upper = (1u64 << (log2_val + 1)) - 1;
-            (lower, upper)
-        }
-    }
-
-    fn print_timeslice_stats(
-        &self,
-        entries: &[ProcessEntry],
-        detailed: bool,
-        collapsed: bool,
-    ) -> Result<()> {
-        let title = if collapsed {
-            "Collapsed Time Slice Statistics"
-        } else {
-            "Per-Process Time Slice Statistics"
-        };
-
-        println!("=== {} (microseconds) ===\n", title);
-
-        if detailed {
-            // Detailed mode: show all entries
-            let entry_refs: Vec<&ProcessEntry> = entries.iter().collect();
-            self.print_timeslice_table(&entry_refs, collapsed);
-        } else {
-            // Grouped mode: group by involuntary switch rate
-            println!("Time slice statistics grouped by preemption rate:\n");
-
-            // Sort by involuntary context switch rate
-            let mut sorted_entries: Vec<&ProcessEntry> = entries.iter().collect();
-            sorted_entries.sort_by(|a, b| {
-                let a_rate = if a.timeslice_stats.involuntary_count > 0 {
-                    a.timeslice_stats.involuntary_count as f64
-                        / (self.get_total_count(&a.timeslice_stats.voluntary)
-                            + self.get_total_count(&a.timeslice_stats.involuntary))
-                            as f64
-                } else {
-                    0.0
-                };
-
-                let b_rate = if b.timeslice_stats.involuntary_count > 0 {
-                    b.timeslice_stats.involuntary_count as f64
-                        / (self.get_total_count(&b.timeslice_stats.voluntary)
-                            + self.get_total_count(&b.timeslice_stats.involuntary))
-                            as f64
-                } else {
-                    0.0
-                };
-
-                b_rate.partial_cmp(&a_rate).unwrap()
-            });
-
-            let show_count = sorted_entries.len().min(10);
-            let table_entries: Vec<&ProcessEntry> =
-                sorted_entries.iter().take(show_count).copied().collect();
-
-            self.print_timeslice_table(&table_entries, collapsed);
-
-            if sorted_entries.len() > show_count {
-                println!("  ... and {} more\n", sorted_entries.len() - show_count);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn print_timeslice_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
-        // Calculate the maximum command name length
-        let max_comm_len = entries
-            .iter()
-            .map(|e| e.comm.len())
-            .max()
-            .unwrap_or(7)
-            .max(7);
-
-        if collapsed {
-            println!(
-                "  {:<width$} {:<8} {:<12} {:<20} {:<20} {:<12}",
-                "COMMAND",
-                "PROCS",
-                "INVOL_COUNT",
-                "VOLUNTARY(p50/p90)",
-                "PREEMPTED(p50/p90)",
-                "PREEMPT%",
-                width = max_comm_len
-            );
-        } else {
-            println!(
-                "  {:<8} {:<width$} {:<12} {:<20} {:<20} {:<12}",
-                "PID",
-                "COMMAND",
-                "INVOL_COUNT",
-                "VOLUNTARY(p50/p90)",
-                "PREEMPTED(p50/p90)",
-                "PREEMPT%",
-                width = max_comm_len
-            );
-        }
-
-        for entry in entries {
-            let vol_count = self.get_total_count(&entry.timeslice_stats.voluntary);
-            let invol_count = self.get_total_count(&entry.timeslice_stats.involuntary);
-            let total = vol_count + invol_count;
-
-            let vol_p50 = self.calculate_percentile(&entry.timeslice_stats.voluntary, 50);
-            let vol_p90 = self.calculate_percentile(&entry.timeslice_stats.voluntary, 90);
-            let invol_p50 = self.calculate_percentile(&entry.timeslice_stats.involuntary, 50);
-            let invol_p90 = self.calculate_percentile(&entry.timeslice_stats.involuntary, 90);
-
-            let preempt_pct = if total > 0 {
-                (entry.timeslice_stats.involuntary_count as f64 / total as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            let vol_str = if vol_count > 0 {
-                format!("{}/{}", vol_p50, vol_p90)
-            } else {
-                "-".to_string()
-            };
-
-            let invol_str = if invol_count > 0 {
-                format!("{}/{}", invol_p50, invol_p90)
-            } else {
-                "-".to_string()
-            };
-
-            if collapsed {
-                println!(
-                    "  {:<width$} {:<8} {:<12} {:<20} {:<20} {:<12.1}%",
-                    &entry.comm,
-                    entry.pids.len(),
-                    entry.timeslice_stats.involuntary_count,
-                    vol_str,
-                    invol_str,
-                    preempt_pct,
-                    width = max_comm_len
-                );
-            } else {
-                println!(
-                    "  {:<8} {:<width$} {:<12} {:<20} {:<20} {:<12.1}%",
-                    entry.pids[0],
-                    &entry.comm,
-                    entry.timeslice_stats.involuntary_count,
-                    vol_str,
-                    invol_str,
-                    preempt_pct,
-                    width = max_comm_len
-                );
-            }
-        }
-    }
-
-    fn print_process_stats(
-        &self,
-        entries: &[ProcessEntry],
-        detailed: bool,
-        collapsed: bool,
-    ) -> Result<()> {
-        let title = if collapsed {
-            "Collapsed Scheduling Delays by Command"
-        } else {
-            "Per-Process Scheduling Delays"
-        };
-
-        println!("=== {} (microseconds) ===\n", title);
-
-        if detailed {
-            // Detailed mode: show all entries
-            let entry_refs: Vec<&ProcessEntry> = entries.iter().collect();
-            self.print_process_table(&entry_refs, collapsed);
-        } else {
-            // Grouped mode: group by latency ranges
-            let mut latency_groups: HashMap<LatencyGroup, Vec<&ProcessEntry>> = HashMap::new();
-
-            for entry in entries {
-                let p90 = self.calculate_percentile(&entry.hist, 90);
-                let group = LatencyGroup::from_percentile(p90);
-                latency_groups
-                    .entry(group)
-                    .or_insert_with(Vec::new)
-                    .push(entry);
-            }
-
-            let mut groups: Vec<_> = latency_groups.iter().collect();
-            groups.sort_by_key(|(group, _)| *group);
-
-            for (group, group_entries) in groups {
-                println!("{} ({} entries):", group.description(), group_entries.len());
-
-                // Sort by p90 descending
-                let mut sorted_entries = group_entries.clone();
-                sorted_entries.sort_by(|a, b| {
-                    let p90_a = self.calculate_percentile(&a.hist, 90);
-                    let p90_b = self.calculate_percentile(&b.hist, 90);
-                    p90_b.cmp(&p90_a)
-                });
-
-                // Show top 10 by p90
-                let show_count = sorted_entries.len().min(10);
-                let table_entries: Vec<&ProcessEntry> =
-                    sorted_entries.iter().take(show_count).copied().collect();
-
-                self.print_process_table(&table_entries, collapsed);
-
-                if sorted_entries.len() > show_count {
-                    println!("  ... and {} more\n", sorted_entries.len() - show_count);
-                } else {
-                    println!();
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn print_process_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
-        // Calculate the maximum command name length
-        let max_comm_len = entries
-            .iter()
-            .map(|e| e.comm.len())
-            .max()
-            .unwrap_or(7)
-            .max(7);
-
-        // Use the collapsed parameter to determine format, not the data
-        if collapsed {
-            println!(
-                "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12} {:<20}",
-                "COMMAND",
-                "PROCS",
-                "p50",
-                "p90",
-                "p99",
-                "COUNT",
-                "PIDs",
-                width = max_comm_len
-            );
-        } else {
-            println!(
-                "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                "PID",
-                "COMMAND",
-                "p50",
-                "p90",
-                "p99",
-                "COUNT",
-                width = max_comm_len
-            );
-        }
-
-        for entry in entries {
-            let total_count = self.get_total_count(&entry.hist);
-            let p50 = self.calculate_percentile(&entry.hist, 50);
-            let p90 = self.calculate_percentile(&entry.hist, 90);
-            let p99 = self.calculate_percentile(&entry.hist, 99);
-
-            if collapsed {
-                let pid_str = self.format_pid_list(&entry.pids);
-                println!(
-                    "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12} {:<20}",
-                    &entry.comm,
-                    entry.pids.len(),
-                    p50,
-                    p90,
-                    p99,
-                    total_count,
-                    pid_str,
-                    width = max_comm_len
-                );
-            } else {
-                println!(
-                    "  {:<8} {:<width$} {:<10} {:<10} {:<10} {:<12}",
-                    entry.pids[0],
-                    &entry.comm,
-                    p50,
-                    p90,
-                    p99,
-                    total_count,
-                    width = max_comm_len
-                );
-            }
-        }
-    }
-
     fn print_cpu_stats(&self, filters: &FilterOptions, detailed: bool) -> Result<()> {
-        let filtered_cpus: Vec<(u32, &Hist)> = self
-            .cpu_stats
+        self.print_cpu_metric_stats(
+            &self.cpu_stats,
+            "Per-CPU Scheduling Delays",
+            filters,
+            detailed,
+            false,
+        )
+    }
+
+    fn print_cpu_idle_stats(&self, filters: &FilterOptions, detailed: bool) -> Result<()> {
+        self.print_cpu_metric_stats(
+            &self.cpu_idle_stats,
+            "Per-CPU Idle Duration",
+            filters,
+            detailed,
+            true,
+        )
+    }
+
+    // Generic CPU stats printer
+    fn print_cpu_metric_stats(
+        &self,
+        cpu_stats: &HashMap<u32, Hist>,
+        title: &str,
+        filters: &FilterOptions,
+        detailed: bool,
+        is_idle: bool,
+    ) -> Result<()> {
+        let filtered_cpus: Vec<(u32, &Hist)> = cpu_stats
             .iter()
             .filter(|(_, hist)| {
-                let total_count = self.get_total_count(hist);
+                let total_count = hist.total_count();
                 if total_count == 0 {
                     return false;
                 }
-                // Apply latency filter if specified
-                if filters.min_latency_us > 0 {
+                if !is_idle && filters.min_latency_us > 0 {
                     let p50 = self.calculate_percentile(hist, 50);
                     p50 >= filters.min_latency_us
                 } else {
@@ -1343,11 +773,16 @@ impl RschedStats {
             .collect();
 
         if filtered_cpus.is_empty() {
-            println!("\nNo CPUs match the specified filters.");
+            println!("\n=== {} (microseconds) ===", title);
+            if is_idle {
+                println!("No CPU idle data collected yet.\n");
+            } else {
+                println!("No CPUs match the specified filters.\n");
+            }
             return Ok(());
         }
 
-        println!("\n=== Per-CPU Scheduling Delays (microseconds) ===\n");
+        println!("\n=== {} (microseconds) ===\n", title);
 
         if detailed {
             // Detailed mode: show all CPUs
@@ -1360,7 +795,7 @@ impl RschedStats {
             sorted_cpus.sort_by_key(|(cpu, _)| *cpu);
 
             for (cpu, hist) in sorted_cpus {
-                let total_count = self.get_total_count(hist);
+                let total_count = hist.total_count();
                 let p50 = self.calculate_percentile(hist, 50);
                 let p90 = self.calculate_percentile(hist, 90);
                 let p99 = self.calculate_percentile(hist, 99);
@@ -1371,72 +806,164 @@ impl RschedStats {
                 );
             }
         } else {
-            // Grouped mode: group CPUs by latency
-            let mut cpu_groups: HashMap<LatencyGroup, Vec<u32>> = HashMap::new();
-
-            for (cpu, hist) in filtered_cpus {
-                let p90 = self.calculate_percentile(hist, 90);
-                let group = LatencyGroup::from_percentile(p90);
-                cpu_groups.entry(group).or_insert_with(Vec::new).push(cpu);
-            }
-
-            let mut groups: Vec<_> = cpu_groups.iter().collect();
-            groups.sort_by_key(|(group, _)| *group);
-
-            for (group, cpus) in groups {
-                let mut sorted_cpus = cpus.clone();
-                sorted_cpus.sort();
-
-                println!(
-                    "{}: CPUs {}",
-                    group.description(),
-                    format_cpu_list(&sorted_cpus)
-                );
-
-                // Show aggregate stats for this CPU group
-                let mut total_hist = Hist::default();
-                for cpu in &sorted_cpus {
-                    if let Some(hist) = self.cpu_stats.get(cpu) {
-                        for i in 0..MAX_SLOTS {
-                            total_hist.slots[i] += hist.slots[i];
-                        }
-                    }
-                }
-
-                let total_count = self.get_total_count(&total_hist);
-                let p50 = self.calculate_percentile(&total_hist, 50);
-                let p90 = self.calculate_percentile(&total_hist, 90);
-                let p99 = self.calculate_percentile(&total_hist, 99);
-
-                println!(
-                    "  Aggregate: p50={:<6} p90={:<6} p99={:<6} count={}\n",
-                    p50, p90, p99, total_count
-                );
+            // Grouped mode
+            if is_idle {
+                self.print_grouped_cpu_stats::<IdleDurationGroup>(cpu_stats, &filtered_cpus);
+            } else {
+                self.print_grouped_cpu_stats::<LatencyGroup>(cpu_stats, &filtered_cpus);
             }
         }
 
         Ok(())
     }
 
+    fn print_grouped_cpu_stats<G: PercentileGroup + Eq + std::hash::Hash>(
+        &self,
+        cpu_stats: &HashMap<u32, Hist>,
+        filtered_cpus: &[(u32, &Hist)],
+    ) {
+        let mut cpu_groups: HashMap<G, Vec<u32>> = HashMap::new();
+
+        for (cpu, hist) in filtered_cpus {
+            let p90 = self.calculate_percentile(hist, 90);
+            let group = G::from_percentile(p90);
+            cpu_groups.entry(group).or_default().push(*cpu);
+        }
+
+        let mut groups: Vec<_> = cpu_groups.into_iter().collect();
+        groups.sort_by_key(|(group, _)| *group);
+
+        for (group, mut cpus) in groups {
+            cpus.sort();
+            println!("{}: CPUs {}", group.description(), format_cpu_list(&cpus));
+
+            // Show aggregate stats
+            let mut total_hist = Hist::default();
+            for cpu in &cpus {
+                if let Some(hist) = cpu_stats.get(cpu) {
+                    total_hist.merge_into(hist);
+                }
+            }
+
+            let total_count = total_hist.total_count();
+            let p50 = self.calculate_percentile(&total_hist, 50);
+            let p90 = self.calculate_percentile(&total_hist, 90);
+            let p99 = self.calculate_percentile(&total_hist, 99);
+
+            println!(
+                "  Aggregate: p50={:<6} p90={:<6} p99={:<6} count={}\n",
+                p50, p90, p99, total_count
+            );
+        }
+    }
+
+    fn build_process_entries(&self, filters: &FilterOptions, collapse: bool) -> Vec<ProcessEntry> {
+        if collapse {
+            self.build_collapsed_entries(filters)
+        } else {
+            self.build_individual_entries(filters)
+        }
+    }
+
+    fn build_collapsed_entries(&self, filters: &FilterOptions) -> Vec<ProcessEntry> {
+        let mut comm_map: HashMap<String, ProcessEntry> = HashMap::new();
+
+        // Process all stats types
+        for (pid, stats) in &self.pid_stats {
+            if !self.should_include_process(pid, &stats.comm, filters)
+                || stats.data.total_count() == 0
+            {
+                continue;
+            }
+
+            let entry = comm_map.entry(stats.comm.clone()).or_insert(ProcessEntry {
+                comm: stats.comm.clone(),
+                hist: Hist::default(),
+                timeslice_stats: TimesliceStats::default(),
+                nr_running_hist: Hist::default(),
+                waking_delay_hist: Hist::default(),
+                sleep_duration_hist: Hist::default(),
+                pids: Vec::new(),
+            });
+
+            entry.hist.merge_into(&stats.data);
+            entry.pids.push(*pid);
+        }
+
+        // Add other stats types
+        for (_, ts_data) in &self.timeslice_stats {
+            if let Some(entry) = comm_map.get_mut(&ts_data.comm) {
+                entry.timeslice_stats.merge_into(&ts_data.data);
+            }
+        }
+
+        for (_, nr_data) in &self.nr_running_stats {
+            if let Some(entry) = comm_map.get_mut(&nr_data.comm) {
+                entry.nr_running_hist.merge_into(&nr_data.data);
+            }
+        }
+
+        for (_, wd_data) in &self.waking_delay_stats {
+            if let Some(entry) = comm_map.get_mut(&wd_data.comm) {
+                entry.waking_delay_hist.merge_into(&wd_data.data);
+            }
+        }
+
+        for (_, sd_data) in &self.sleep_duration_stats {
+            if let Some(entry) = comm_map.get_mut(&sd_data.comm) {
+                entry.sleep_duration_hist.merge_into(&sd_data.data);
+            }
+        }
+
+        comm_map.into_values().collect()
+    }
+
+    fn build_individual_entries(&self, filters: &FilterOptions) -> Vec<ProcessEntry> {
+        self.pid_stats
+            .iter()
+            .filter(|(pid, stats)| {
+                self.should_include_process(pid, &stats.comm, filters)
+                    && stats.data.total_count() > 0
+            })
+            .map(|(pid, stats)| {
+                let get_hist = |map: &HashMap<u32, HistogramStats>| {
+                    map.get(pid).map(|s| s.data.clone()).unwrap_or_default()
+                };
+
+                ProcessEntry {
+                    comm: stats.comm.clone(),
+                    hist: stats.data.clone(),
+                    timeslice_stats: self
+                        .timeslice_stats
+                        .get(pid)
+                        .map(|ts| ts.data.clone())
+                        .unwrap_or_default(),
+                    nr_running_hist: get_hist(&self.nr_running_stats),
+                    waking_delay_hist: get_hist(&self.waking_delay_stats),
+                    sleep_duration_hist: get_hist(&self.sleep_duration_stats),
+                    pids: vec![*pid],
+                }
+            })
+            .collect()
+    }
+
+    // Keep existing helper methods
     fn should_include_process(&self, pid: &u32, comm: &str, filters: &FilterOptions) -> bool {
-        // Check PID filter
         if let Some(filter_pid) = filters.pid_filter {
             if *pid != filter_pid {
                 return false;
             }
         }
 
-        // Check comm regex filter
         if let Some(ref regex) = filters.comm_regex {
             if !regex.is_match(comm) {
                 return false;
             }
         }
 
-        // Check latency threshold - use p50 as representative
         if filters.min_latency_us > 0 {
             if let Some(stats) = self.pid_stats.get(pid) {
-                let p50 = self.calculate_percentile(&stats.hist, 50);
+                let p50 = self.calculate_percentile(&stats.data, 50);
                 if p50 < filters.min_latency_us {
                     return false;
                 }
@@ -1444,6 +971,71 @@ impl RschedStats {
         }
 
         true
+    }
+
+    fn calculate_percentile(&self, hist: &Hist, percentile: u8) -> u64 {
+        let total_count = hist.total_count();
+        if total_count == 0 {
+            return 0;
+        }
+
+        let target_count = (total_count * percentile as u64) / 100;
+        let mut cumulative_count = 0u64;
+
+        for (slot, &count) in hist.slots.iter().enumerate() {
+            let prev_cumulative = cumulative_count;
+            cumulative_count += count as u64;
+
+            if cumulative_count >= target_count {
+                let count_in_bucket = count as u64;
+                let position_in_bucket = target_count - prev_cumulative;
+                let fraction = if count_in_bucket > 0 {
+                    position_in_bucket as f64 / count_in_bucket as f64
+                } else {
+                    0.5
+                };
+
+                let (lower_bound, upper_bound) = self.get_slot_range(slot);
+                let range = upper_bound - lower_bound + 1;
+                return lower_bound + (fraction * range as f64) as u64;
+            }
+        }
+
+        1u64 << 27
+    }
+
+    fn calculate_nr_running_percentile(&self, hist: &Hist, percentile: u8) -> u32 {
+        let total_count = hist.total_count();
+        if total_count == 0 {
+            return 0;
+        }
+
+        let target_count = (total_count * percentile as u64) / 100;
+        let mut cumulative_count = 0u64;
+
+        for (slot, &count) in hist.slots.iter().enumerate() {
+            cumulative_count += count as u64;
+            if cumulative_count >= target_count {
+                return slot as u32;
+            }
+        }
+
+        63
+    }
+
+    fn get_slot_range(&self, slot: usize) -> (u64, u64) {
+        if slot < LINEAR_SLOTS {
+            let lower = slot as u64 * LINEAR_STEP;
+            let upper = lower + LINEAR_STEP - 1;
+            (lower, upper)
+        } else if slot == LINEAR_SLOTS {
+            (500, 511)
+        } else {
+            let log2_val = (slot - LINEAR_SLOTS - 1) + 9;
+            let lower = 1u64 << log2_val;
+            let upper = (1u64 << (log2_val + 1)) - 1;
+            (lower, upper)
+        }
     }
 
     fn format_pid_list(&self, pids: &[u32]) -> String {
@@ -1470,8 +1062,61 @@ impl RschedStats {
         }
     }
 
-    fn get_total_count(&self, hist: &Hist) -> u64 {
-        hist.slots.iter().map(|&count| count as u64).sum()
+    pub fn print_schedstat(&self, schedstat_data: &SchedstatData) {
+        println!("\n=== System-wide Schedstat Metrics (deltas) ===");
+
+        let mut metrics: Vec<(&String, &u64)> = schedstat_data.domain_totals.iter().collect();
+        metrics.sort_by(|a, b| a.0.cmp(b.0));
+
+        let metrics_per_col = (metrics.len() + 2) / 3;
+
+        for row in 0..metrics_per_col {
+            for col in 0..3 {
+                let idx = col * metrics_per_col + row;
+                if idx < metrics.len() {
+                    let (name, value) = metrics[idx];
+                    print!("{:<30} {:>9} ", name, value);
+                    if col < 2 {
+                        print!("| ");
+                    }
+                }
+            }
+            println!();
+        }
+
+        if !schedstat_data.cpu_totals.is_empty() {
+            println!("\n=== CPU Field Totals (deltas) ===");
+            let cpu_fields = vec![
+                "yld_count",
+                "sched_count",
+                "sched_goidle",
+                "ttwu_count",
+                "ttwu_local",
+                "rq_cpu_time",
+                "rq_run_delay usec",
+                "rq_pcount",
+            ];
+
+            for (i, field) in cpu_fields.iter().enumerate() {
+                if i < schedstat_data.cpu_totals.len() {
+                    let mut val = schedstat_data.cpu_totals[i];
+                    if *field == "rq_run_delay usec" && i + 1 < schedstat_data.cpu_totals.len() {
+                        val = val / schedstat_data.cpu_totals[i + 1];
+                    }
+                    print!("{:<17} {:>12} ", field, val);
+                    if (i + 1) % 3 == 0 {
+                        println!();
+                    } else {
+                        print!("| ");
+                    }
+                }
+            }
+            if cpu_fields.len() % 3 != 0 {
+                println!();
+            }
+        }
+
+        println!();
     }
 }
 
@@ -1489,21 +1134,21 @@ fn format_cpu_list(cpus: &[u32]) -> String {
         if cpu == end + 1 {
             end = cpu;
         } else {
-            if start == end {
-                ranges.push(format!("{}", start));
+            ranges.push(if start == end {
+                format!("{}", start)
             } else {
-                ranges.push(format!("{}-{}", start, end));
-            }
+                format!("{}-{}", start, end)
+            });
             start = cpu;
             end = cpu;
         }
     }
 
-    if start == end {
-        ranges.push(format!("{}", start));
+    ranges.push(if start == end {
+        format!("{}", start)
     } else {
-        ranges.push(format!("{}-{}", start, end));
-    }
+        format!("{}-{}", start, end)
+    });
 
     ranges.join(",")
 }
