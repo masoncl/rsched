@@ -17,11 +17,23 @@ pub enum OutputMode {
     Collapsed,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct MetricGroups {
+    pub latency: bool,
+    pub cpu_latency: bool,
+    pub slice: bool,
+    pub sleep: bool,
+    pub cpu_idle: bool,
+    pub perf: bool,
+    pub schedstat: bool,
+    pub waking: bool,
+}
+
 pub struct FilterOptions {
     pub comm_regex: Option<Regex>,
     pub pid_filter: Option<u32>,
     pub min_latency_us: u64,
-    pub trace_sched_waking: bool,
+    pub metric_groups: MetricGroups,
 }
 
 // Generic stats data structure to replace all the specific ones
@@ -260,10 +272,17 @@ impl RschedStats {
         // Build process entries based on collapse mode
         let process_entries = self.build_process_entries(filters, collapsed);
 
-        if process_entries.is_empty() {
+        if process_entries.is_empty()
+            && (filters.metric_groups.latency
+                || filters.metric_groups.slice
+                || filters.metric_groups.sleep
+                || filters.metric_groups.waking)
+        {
             println!("No processes match the specified filters.\n");
-        } else {
-            // Print each metric type
+        }
+
+        // Print each metric type based on selected groups
+        if filters.metric_groups.latency {
             self.print_metric_section(
                 &process_entries,
                 "Scheduling Delays",
@@ -273,22 +292,26 @@ impl RschedStats {
                 detailed,
                 collapsed,
             )?;
+        }
 
-            if filters.trace_sched_waking {
-                self.print_metric_section(
-                    &process_entries,
-                    "Waking Delay Statistics",
-                    "(Time from sched_waking to sched_switch)",
-                    |e| &e.waking_delay_hist,
-                    |s, h| s.calculate_percentile(h, 90),
-                    detailed,
-                    collapsed,
-                )?;
-            }
+        if filters.metric_groups.waking {
+            self.print_metric_section(
+                &process_entries,
+                "Waking Delay Statistics",
+                "(Time from sched_waking to sched_switch)",
+                |e| &e.waking_delay_hist,
+                |s, h| s.calculate_percentile(h, 90),
+                detailed,
+                collapsed,
+            )?;
+        }
 
+        if filters.metric_groups.slice {
             self.print_timeslice_stats(&process_entries, detailed, collapsed)?;
             println!();
+        }
 
+        if filters.metric_groups.sleep {
             self.print_metric_section(
                 &process_entries,
                 "Sleep Duration Statistics",
@@ -298,17 +321,26 @@ impl RschedStats {
                 detailed,
                 collapsed,
             )?;
+        }
 
+        if filters.metric_groups.latency {
             self.print_nr_running_stats(&process_entries, detailed, collapsed)?;
         }
 
-        if let Some(data) = &self.schedstat_data {
-            self.print_schedstat(data);
+        if filters.metric_groups.schedstat {
+            if let Some(data) = &self.schedstat_data {
+                self.print_schedstat(data);
+            }
         }
 
-        // Print CPU stats
-        self.print_cpu_stats(filters, detailed)?;
-        self.print_cpu_idle_stats(filters, detailed)?;
+        // Print CPU stats based on selected groups
+        if filters.metric_groups.cpu_latency {
+            self.print_cpu_stats(filters, detailed)?;
+        }
+
+        if filters.metric_groups.cpu_idle {
+            self.print_cpu_idle_stats(filters, detailed)?;
+        }
 
         Ok(())
     }
@@ -865,10 +897,22 @@ impl RschedStats {
         }
     }
 
+    fn create_default_process_entry(comm: String, pids: Vec<u32>) -> ProcessEntry {
+        ProcessEntry {
+            comm,
+            hist: Hist::default(),
+            timeslice_stats: TimesliceStats::default(),
+            nr_running_hist: Hist::default(),
+            waking_delay_hist: Hist::default(),
+            sleep_duration_hist: Hist::default(),
+            pids,
+        }
+    }
+
     fn build_collapsed_entries(&self, filters: &FilterOptions) -> Vec<ProcessEntry> {
         let mut comm_map: HashMap<String, ProcessEntry> = HashMap::new();
 
-        // Process all stats types
+        // Process scheduling delay stats
         for (pid, stats) in &self.pid_stats {
             if !self.should_include_process(pid, &stats.comm, filters)
                 || stats.data.total_count() == 0
@@ -876,42 +920,85 @@ impl RschedStats {
                 continue;
             }
 
-            let entry = comm_map.entry(stats.comm.clone()).or_insert(ProcessEntry {
-                comm: stats.comm.clone(),
-                hist: Hist::default(),
-                timeslice_stats: TimesliceStats::default(),
-                nr_running_hist: Hist::default(),
-                waking_delay_hist: Hist::default(),
-                sleep_duration_hist: Hist::default(),
-                pids: Vec::new(),
+            let entry = comm_map.entry(stats.comm.clone()).or_insert_with(|| {
+                Self::create_default_process_entry(stats.comm.clone(), Vec::new())
             });
 
             entry.hist.merge_into(&stats.data);
-            entry.pids.push(*pid);
-        }
-
-        // Add other stats types
-        for (_, ts_data) in &self.timeslice_stats {
-            if let Some(entry) = comm_map.get_mut(&ts_data.comm) {
-                entry.timeslice_stats.merge_into(&ts_data.data);
+            if !entry.pids.contains(pid) {
+                entry.pids.push(*pid);
             }
         }
 
-        for (_, nr_data) in &self.nr_running_stats {
-            if let Some(entry) = comm_map.get_mut(&nr_data.comm) {
-                entry.nr_running_hist.merge_into(&nr_data.data);
+        // Process timeslice stats
+        for (pid, ts_data) in &self.timeslice_stats {
+            if !self.should_include_process(pid, &ts_data.comm, filters)
+                || ts_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            let entry = comm_map.entry(ts_data.comm.clone()).or_insert_with(|| {
+                Self::create_default_process_entry(ts_data.comm.clone(), Vec::new())
+            });
+
+            entry.timeslice_stats.merge_into(&ts_data.data);
+            if !entry.pids.contains(pid) {
+                entry.pids.push(*pid);
             }
         }
 
-        for (_, wd_data) in &self.waking_delay_stats {
-            if let Some(entry) = comm_map.get_mut(&wd_data.comm) {
-                entry.waking_delay_hist.merge_into(&wd_data.data);
+        // Process nr_running stats
+        for (pid, nr_data) in &self.nr_running_stats {
+            if !self.should_include_process(pid, &nr_data.comm, filters)
+                || nr_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            let entry = comm_map.entry(nr_data.comm.clone()).or_insert_with(|| {
+                Self::create_default_process_entry(nr_data.comm.clone(), Vec::new())
+            });
+
+            entry.nr_running_hist.merge_into(&nr_data.data);
+            if !entry.pids.contains(pid) {
+                entry.pids.push(*pid);
             }
         }
 
-        for (_, sd_data) in &self.sleep_duration_stats {
-            if let Some(entry) = comm_map.get_mut(&sd_data.comm) {
-                entry.sleep_duration_hist.merge_into(&sd_data.data);
+        // Process waking delay stats
+        for (pid, wd_data) in &self.waking_delay_stats {
+            if !self.should_include_process(pid, &wd_data.comm, filters)
+                || wd_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            let entry = comm_map.entry(wd_data.comm.clone()).or_insert_with(|| {
+                Self::create_default_process_entry(wd_data.comm.clone(), Vec::new())
+            });
+
+            entry.waking_delay_hist.merge_into(&wd_data.data);
+            if !entry.pids.contains(pid) {
+                entry.pids.push(*pid);
+            }
+        }
+
+        // Process sleep duration stats
+        for (pid, sd_data) in &self.sleep_duration_stats {
+            if !self.should_include_process(pid, &sd_data.comm, filters)
+                || sd_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            let entry = comm_map.entry(sd_data.comm.clone()).or_insert_with(|| {
+                Self::create_default_process_entry(sd_data.comm.clone(), Vec::new())
+            });
+
+            entry.sleep_duration_hist.merge_into(&sd_data.data);
+            if !entry.pids.contains(pid) {
+                entry.pids.push(*pid);
             }
         }
 
@@ -919,32 +1006,89 @@ impl RschedStats {
     }
 
     fn build_individual_entries(&self, filters: &FilterOptions) -> Vec<ProcessEntry> {
-        self.pid_stats
-            .iter()
-            .filter(|(pid, stats)| {
-                self.should_include_process(pid, &stats.comm, filters)
-                    && stats.data.total_count() > 0
-            })
-            .map(|(pid, stats)| {
-                let get_hist = |map: &HashMap<u32, HistogramStats>| {
-                    map.get(pid).map(|s| s.data.clone()).unwrap_or_default()
-                };
+        let mut pid_entries: HashMap<u32, ProcessEntry> = HashMap::new();
 
-                ProcessEntry {
-                    comm: stats.comm.clone(),
-                    hist: stats.data.clone(),
-                    timeslice_stats: self
-                        .timeslice_stats
-                        .get(pid)
-                        .map(|ts| ts.data.clone())
-                        .unwrap_or_default(),
-                    nr_running_hist: get_hist(&self.nr_running_stats),
-                    waking_delay_hist: get_hist(&self.waking_delay_stats),
-                    sleep_duration_hist: get_hist(&self.sleep_duration_stats),
-                    pids: vec![*pid],
-                }
-            })
-            .collect()
+        // Process scheduling delay stats
+        for (pid, stats) in &self.pid_stats {
+            if !self.should_include_process(pid, &stats.comm, filters)
+                || stats.data.total_count() == 0
+            {
+                continue;
+            }
+
+            pid_entries
+                .entry(*pid)
+                .or_insert_with(|| {
+                    Self::create_default_process_entry(stats.comm.clone(), vec![*pid])
+                })
+                .hist = stats.data.clone();
+        }
+
+        // Process timeslice stats
+        for (pid, ts_data) in &self.timeslice_stats {
+            if !self.should_include_process(pid, &ts_data.comm, filters)
+                || ts_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            pid_entries
+                .entry(*pid)
+                .or_insert_with(|| {
+                    Self::create_default_process_entry(ts_data.comm.clone(), vec![*pid])
+                })
+                .timeslice_stats = ts_data.data.clone();
+        }
+
+        // Process nr_running stats
+        for (pid, nr_data) in &self.nr_running_stats {
+            if !self.should_include_process(pid, &nr_data.comm, filters)
+                || nr_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            pid_entries
+                .entry(*pid)
+                .or_insert_with(|| {
+                    Self::create_default_process_entry(nr_data.comm.clone(), vec![*pid])
+                })
+                .nr_running_hist = nr_data.data.clone();
+        }
+
+        // Process waking delay stats
+        for (pid, wd_data) in &self.waking_delay_stats {
+            if !self.should_include_process(pid, &wd_data.comm, filters)
+                || wd_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            pid_entries
+                .entry(*pid)
+                .or_insert_with(|| {
+                    Self::create_default_process_entry(wd_data.comm.clone(), vec![*pid])
+                })
+                .waking_delay_hist = wd_data.data.clone();
+        }
+
+        // Process sleep duration stats
+        for (pid, sd_data) in &self.sleep_duration_stats {
+            if !self.should_include_process(pid, &sd_data.comm, filters)
+                || sd_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            pid_entries
+                .entry(*pid)
+                .or_insert_with(|| {
+                    Self::create_default_process_entry(sd_data.comm.clone(), vec![*pid])
+                })
+                .sleep_duration_hist = sd_data.data.clone();
+        }
+
+        pid_entries.into_values().collect()
     }
 
     // Keep existing helper methods
@@ -961,7 +1105,8 @@ impl RschedStats {
             }
         }
 
-        if filters.min_latency_us > 0 {
+        // Only apply latency filter if we're showing latency metrics
+        if filters.metric_groups.latency && filters.min_latency_us > 0 {
             if let Some(stats) = self.pid_stats.get(pid) {
                 let p50 = self.calculate_percentile(&stats.data, 50);
                 if p50 < filters.min_latency_us {

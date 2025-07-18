@@ -12,8 +12,6 @@ use perf::PerfCounterSetup;
 use regex::Regex;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // Include the generated skeleton file
@@ -21,7 +19,7 @@ include!(concat!(env!("OUT_DIR"), "/rsched.skel.rs"));
 
 use cpu_metrics::CpuMetrics;
 use rsched_collector::RschedCollector;
-use rsched_stats::{FilterOptions, OutputMode, RschedStats};
+use rsched_stats::{FilterOptions, MetricGroups, OutputMode, RschedStats};
 use schedstat::SchedstatCollector;
 
 #[derive(Parser, Debug)]
@@ -51,21 +49,57 @@ struct Args {
     #[arg(short = 'l', long)]
     min_latency: Option<u64>,
 
-    /// Don't Collapse/aggregate by command name
+    /// Don't collapse/aggregate by command name
     #[arg(short = 'C', long)]
     no_collapse: bool,
 
-    /// Trace sched_waking events as well (with added perf overhead)
-    #[arg(short = 'w', long)]
-    trace_sched_waking: bool,
+    /// Select metric groups to display (comma-separated: latency,slice,sleep,perf,schedstat,waking,most,all)
+    #[arg(short = 'g', long, default_value = "latency", value_delimiter = ',')]
+    group: Vec<String>,
+}
 
-    /// Enable /proc/schedstat collection and display
-    #[clap(short = 's', long)]
-    schedstat: bool,
-    ///
-    /// Enable CPU performance counter metrics
-    #[arg(short = 'm', long)]
-    cpu_metrics: bool,
+fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
+    let mut metric_groups = MetricGroups::default();
+
+    for group in groups {
+        match group.as_str() {
+            "all" => {
+                metric_groups.latency = true;
+                metric_groups.cpu_latency = true;
+                metric_groups.slice = true;
+                metric_groups.sleep = true;
+                metric_groups.cpu_idle = true;
+                metric_groups.perf = true;
+                metric_groups.schedstat = true;
+                metric_groups.waking = true;
+            }
+            "most" => {
+                // just all minus waking
+                metric_groups.latency = true;
+                metric_groups.cpu_latency = true;
+                metric_groups.slice = true;
+                metric_groups.sleep = true;
+                metric_groups.cpu_idle = true;
+                metric_groups.perf = true;
+                metric_groups.schedstat = true;
+            }
+            "latency" => {
+                metric_groups.latency = true;
+                metric_groups.cpu_latency = true;
+            }
+            "slice" => metric_groups.slice = true,
+            "sleep" => {
+                metric_groups.sleep = true;
+                metric_groups.cpu_idle = true;
+            }
+            "perf" => metric_groups.perf = true,
+            "schedstat" => metric_groups.schedstat = true,
+            "waking" => metric_groups.waking = true,
+            _ => anyhow::bail!("Unknown metric group: {}. Valid groups are: latency, slice, sleep, perf, schedstat, waking, most, all", group),
+        }
+    }
+
+    Ok(metric_groups)
 }
 
 fn enable_schedstat() -> Result<()> {
@@ -76,6 +110,9 @@ fn enable_schedstat() -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Parse metric groups
+    let metric_groups = parse_metric_groups(&args.group)?;
+
     // command line comm regex
     let comm_regex = args
         .comm
@@ -83,14 +120,15 @@ fn main() -> Result<()> {
         .map(|pattern| Regex::new(pattern))
         .transpose()?;
 
-    let running = Arc::new(AtomicBool::new(true));
+    println!("Starting rsched");
 
-    println!("Starting rsched - Runqueue scheduling delay tracker");
+    // Print active options
     if comm_regex.is_some()
         || args.pid.is_some()
         || args.min_latency.is_some()
         || args.no_collapse
         || args.run_time.is_some()
+        || args.group != vec!["latency"]
     {
         println!("Options active:");
         if let Some(ref regex) = comm_regex {
@@ -108,8 +146,48 @@ fn main() -> Result<()> {
         if let Some(runtime) = args.run_time {
             println!("  - Runtime limit: {} seconds", runtime);
         }
+
+        // Print active metric groups
+        let active_groups: Vec<&str> = vec![
+            if metric_groups.latency {
+                Some("latency")
+            } else {
+                None
+            },
+            if metric_groups.slice {
+                Some("slice")
+            } else {
+                None
+            },
+            if metric_groups.sleep {
+                Some("sleep")
+            } else {
+                None
+            },
+            if metric_groups.perf {
+                Some("perf")
+            } else {
+                None
+            },
+            if metric_groups.schedstat {
+                Some("schedstat")
+            } else {
+                None
+            },
+            if metric_groups.waking {
+                Some("waking")
+            } else {
+                None
+            },
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        if !active_groups.is_empty() {
+            println!("  - Metric groups: {}", active_groups.join(", "));
+        }
     }
-    println!("Press Ctrl-C to stop...\n");
 
     let skel_builder = RschedSkelBuilder::default();
     let mut open_object = MaybeUninit::uninit();
@@ -120,20 +198,18 @@ fn main() -> Result<()> {
         .rodata_data
         .as_deref_mut()
         .unwrap()
-        .trace_sched_waking = args.trace_sched_waking as u32;
+        .trace_sched_waking = metric_groups.waking as u32;
 
-    if !args.trace_sched_waking {
+    if !metric_groups.waking {
         // Disable both BTF and raw tracepoint versions to reduce overhead
         open_skel.progs.handle_sched_waking_btf.set_autoload(false);
         open_skel.progs.handle_sched_waking_raw.set_autoload(false);
-
-        println!("Sched_waking tracepoints disabled for better performance");
     }
 
     let mut skel = open_skel.load()?;
     skel.attach()?;
 
-    let _perf_setup = if args.cpu_metrics {
+    let _perf_setup = if metric_groups.perf {
         let mut setup = PerfCounterSetup::new();
         setup.setup_and_attach(&skel.maps)?;
         println!("CPU performance counters enabled");
@@ -145,7 +221,7 @@ fn main() -> Result<()> {
     let maps = &skel.maps;
     let mut collector = RschedCollector::new(&maps);
     let mut stats = RschedStats::new();
-    let mut schedstat_collector = if args.schedstat {
+    let mut schedstat_collector = if metric_groups.schedstat {
         enable_schedstat()?;
         Some(SchedstatCollector::new()?)
     } else {
@@ -166,7 +242,7 @@ fn main() -> Result<()> {
         OutputMode::Grouped
     };
 
-    let mut cpu_metrics = if args.cpu_metrics {
+    let mut cpu_metrics = if metric_groups.perf {
         Some(CpuMetrics::new())
     } else {
         None
@@ -176,7 +252,7 @@ fn main() -> Result<()> {
         comm_regex,
         pid_filter: args.pid,
         min_latency_us: args.min_latency.unwrap_or(0),
-        trace_sched_waking: args.trace_sched_waking,
+        metric_groups: metric_groups.clone(),
     };
 
     // Track start time for runtime limit
@@ -210,11 +286,6 @@ fn main() -> Result<()> {
             break;
         }
 
-        // Check if we should continue after sleeping
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-
         // Check runtime limit again after sleep
         if let Some(limit) = runtime_limit {
             if start_time.elapsed() >= limit {
@@ -223,19 +294,55 @@ fn main() -> Result<()> {
             }
         }
 
-        let histograms = collector.collect_histograms()?;
-        let cpu_histograms = collector.collect_cpu_histograms()?;
-        let timeslice_stats = collector.collect_timeslice_stats()?;
-        let nr_running_hists = collector.collect_nr_running_hists()?;
-        let waking_delays = collector.collect_waking_delays()?;
-        let sleep_durations = collector.collect_sleep_durations()?;
-        let cpu_idle_histograms = collector.collect_cpu_idle_histograms()?;
+        // Collect only the data we need based on active metric groups
+        let histograms = if metric_groups.latency {
+            collector.collect_histograms()?
+        } else {
+            HashMap::new()
+        };
+
+        let cpu_histograms = if metric_groups.cpu_latency {
+            collector.collect_cpu_histograms()?
+        } else {
+            HashMap::new()
+        };
+
+        let timeslice_stats = if metric_groups.slice {
+            collector.collect_timeslice_stats()?
+        } else {
+            HashMap::new()
+        };
+
+        let nr_running_hists = if metric_groups.latency {
+            collector.collect_nr_running_hists()?
+        } else {
+            HashMap::new()
+        };
+
+        let waking_delays = if metric_groups.waking {
+            collector.collect_waking_delays()?
+        } else {
+            HashMap::new()
+        };
+
+        let sleep_durations = if metric_groups.sleep {
+            collector.collect_sleep_durations()?
+        } else {
+            HashMap::new()
+        };
+
+        let cpu_idle_histograms = if metric_groups.cpu_idle {
+            collector.collect_cpu_idle_histograms()?
+        } else {
+            HashMap::new()
+        };
 
         if let Some(ref mut schedstat) = schedstat_collector {
             let schedstat_data = schedstat.collect()?;
             stats.update_schedstat(schedstat_data);
         }
-        let cpu_perf_data = if args.cpu_metrics {
+
+        let cpu_perf_data = if metric_groups.perf {
             collector.collect_cpu_perf()?
         } else {
             HashMap::new()

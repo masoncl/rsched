@@ -1,7 +1,7 @@
 # rsched - Rust Scheduling Delay Tracker
 
 A BPF-based tool written in Rust that tracks kernel metrics related to
-scheduling.  The goal is to give a high level overview of kernel process
+scheduling. The goal is to give a high level overview of kernel process
 scheduling decisions with relatively low overhead.
 
 ## Overview
@@ -11,8 +11,10 @@ rsched uses tracepoints and performance counters to monitor:
 - **Time slice analysis**: Duration and preemption statistics
 - **Runqueue depth**: Number of tasks waiting when processes are woken
 - **Wakeup delays**: Time from sched_waking to sched_switch
-- schedstats: via /proc/schedstats
-- CPU cycles and instructions: both user and kernel time
+- **Sleep duration**: Time spent sleeping between context switches
+- **CPU idle duration**: How long CPUs remain idle
+- **schedstats**: via /proc/schedstats
+- **CPU cycles and instructions**: both user and kernel time
 
 ## Prerequisites
 
@@ -25,8 +27,7 @@ rsched uses tracepoints and performance counters to monitor:
 
 ```bash
 # Install dependencies
-
-libbpf-dev clang llvm
+sudo apt-get install libbpf-dev clang llvm
 
 # Clone and build
 git clone <repository>
@@ -36,7 +37,7 @@ cargo build --release
 
 ### Generate vmlinux.h
 
-rsched ships with a vmlinux.h from libbpf-tools.  If this is out of date, you
+rsched ships with a vmlinux.h from libbpf-tools. If this is out of date, you
 might need to regenerate:
 
 ```bash
@@ -58,18 +59,30 @@ sudo ./target/release/rsched [OPTIONS]
 - `-p, --pid <PID>`: Filter by specific PID
 - `-l, --min-latency <MICROSECONDS>`: Minimum latency threshold
 - `-C, --no-collapse`: Don't collapse/aggregate by command name
-- `-w, --trace-sched-waking`: Trace sched_waking events (adds overhead)
-- `-s, --schedstat`: Enable schedstats and output them
-- `-m, --cpu-metrics`: report on cycles and IPC per process
+- `-g, --group <GROUPS>`: Select metric groups to display (comma-separated)
+  - `latency`: Scheduling delays and runqueue depth (default)
+  - `slice`: Time slice statistics
+  - `sleep`: Sleep duration and CPU idle statistics
+  - `perf`: CPU performance counters (cycles and IPC)
+  - `schedstat`: /proc/schedstat metrics
+  - `waking`: Waking delay tracking (adds overhead)
+  - `most`: Enable most metric groups (all except waking)
+  - `all`: Enable all metric groups
 
 ### Examples
 
 ```bash
-# Basic usage - shows grouped output
+# Basic usage - shows scheduling latency only
 sudo ./target/release/rsched
 
-# Run for 30 seconds then exit
-sudo ./target/release/rsched -r 30
+# Show all metric groups
+sudo ./target/release/rsched -g all
+
+# Show time slice and sleep metrics
+sudo ./target/release/rsched -g slice,sleep
+
+# Run for 30 seconds with performance counters
+sudo ./target/release/rsched -r 30 -g latency,perf
 
 # Show detailed per-process statistics
 sudo ./target/release/rsched -d
@@ -80,16 +93,21 @@ sudo ./target/release/rsched -l 100
 # Track only processes matching "schbench"
 sudo ./target/release/rsched -c "schbench.*"
 
-# Show all pids from schbench worker processes into one entry
+# Show all pids from schbench worker processes as separate entries
 sudo ./target/release/rsched -C -c "schbench.*"
 
 # Enable waking delay tracking for 60 seconds
-sudo ./target/release/rsched -w -r 60
+sudo ./target/release/rsched -g waking -r 60
+
+# Enable schedstats
+sudo ./target/release/rsched -g schedstat
 ```
 
 ## Output Interpretation
 
-### Scheduling Delays
+The output varies based on the selected metric groups:
+
+### Scheduling Delays (group: latency)
 
 Shows time processes spend in the runqueue waiting to be scheduled:
 
@@ -108,7 +126,17 @@ Very High (>10ms) (2 entries):
   schbench        1        9          14563      24576      34           2190964
 ```
 
-### Time Slice Statistics
+### Runqueue Depth (group: latency)
+
+Shows `rq->nr_running` when each process was woken
+
+```
+  COMMAND         PROCS    p50        p90        p99        COUNT
+  schbench-worker 1024     1          1          2          93226439
+  schbench        1        1          1          1          20
+```
+
+### Time Slice Statistics (group: slice)
 
 Tracks how long processes run before context switching:
 - **VOLUNTARY**: Process yielded CPU voluntarily, along with p50 and p90 time slice length
@@ -122,7 +150,7 @@ Tracks how long processes run before context switching:
   schbench        1        0            18/50                -                    0.0         %
 ```
 
-### Per-process sleep duration
+### Sleep Duration Statistics (group: sleep)
 
 Time spent sleeping between sched_switch and sched_wakeup
 
@@ -134,19 +162,40 @@ Medium (100μs-1ms) (1 entries):
 Very High (>10ms) (1 entries):
   COMMAND  PROCS    p50        p90        p99        COUNT
   schbench 1        757304     990321     990321     9
-
-```
-### Runqueue Depth
-
-Shows `rq->nr_running` when each process was woken
-
-```
-  COMMAND         PROCS    p50        p90        p99        COUNT
-  schbench-worker 1024     1          1          2          93226439
-  schbench        1        1          1          1          20
 ```
 
-### schedstats
+### Per-CPU idle duration (group: sleep)
+
+```
+Very Short (<100μs): CPUs 4-15,126-141
+  Aggregate: p50=6      p90=16     p99=39     count=26704057
+
+Short (100μs-1ms): CPUs 16-125,142-251
+  Aggregate: p50=73     p90=270    p99=433    count=19646721
+```
+
+### CPU Performance Counters (group: perf)
+
+Cycles per second
+
+```
+Global: User 5628.1M cycles/sec (IPC: 0.27), Kernel 24109.4M cycles/sec (IPC: 1.39)
+
+CPU Performance by Usage Group (cycles are per timeslice):
+
+Medium (100M-1G cycles p99) (1 entries):
+  COMMAND      PROCS    USER CYC(p50/p99)    KERN CYC(p50/p99)    U-IPC    K-IPC    PIDs
+  schbench-msg 4        24.4M/33.3M          192.2M/266.6M        0.12     0.71     3658281,3658282,3658283,...(+1)
+
+Very Low (<10M cycles p99) (2 entries):
+  COMMAND         PROCS    USER CYC(p50/p99)    KERN CYC(p50/p99)    U-IPC    K-IPC    PIDs
+  schbench        1        52.4K/65.5K          14.3K/65.5K          3.49     3.32     3658280
+  schbench-worker 1024     1.5K/3.9K            6.1K/11.5K           0.30     1.64     3658285,3658286,3658287,...(+1021)
+```
+
+### schedstats (group: schedstat)
+
+System-wide scheduler statistics from /proc/schedstat:
 
 schedstat deltas are per-interval -i N
 
@@ -174,46 +223,23 @@ ttwu_count            22544931 | ttwu_local            22729275 | rq_cpu_time   
 rq_run_delay usec            4 | rq_pcount          21582151769 |
 ```
 
-### Per-CPU idle duration
+### Waking Delays (group: waking)
 
-```
-Very Short (<100μs): CPUs 4-15,126-141
-  Aggregate: p50=6      p90=16     p99=39     count=26704057
-
-Short (100μs-1ms): CPUs 16-125,142-251
-  Aggregate: p50=73     p90=270    p99=433    count=19646721
-```
-
-### Per-CPU Scheduling Delay Statistics
-
-```
-Very Low (<10μs): CPUs 0-251
-  Aggregate: p50=5      p90=9      p99=9      count=46512458
-```
-
-### CPU Performance Counters
-
-Cycles per second
-
-```
-Global: User 5628.1M cycles/sec (IPC: 0.27), Kernel 24109.4M cycles/sec (IPC: 1.39)
-
-CPU Performance by Usage Group (cycles are per timeslice):
-
-Medium (100M-1G cycles p99) (1 entries):
-  COMMAND      PROCS    USER CYC(p50/p99)    KERN CYC(p50/p99)    U-IPC    K-IPC    PIDs
-  schbench-msg 4        24.4M/33.3M          192.2M/266.6M        0.12     0.71     3658281,3658282,3658283,...(+1)
-
-Very Low (<10M cycles p99) (2 entries):
-  COMMAND         PROCS    USER CYC(p50/p99)    KERN CYC(p50/p99)    U-IPC    K-IPC    PIDs
-  schbench        1        52.4K/65.5K          14.3K/65.5K          3.49     3.32     3658280
-  schbench-worker 1024     1.5K/3.9K            6.1K/11.5K           0.30     1.64     3658285,3658286,3658287,...(+1021)
-```
+Time from sched_waking to sched_switch (requires `-g waking`):
 
 ## Performance Notes
 
-- Minimal overhead in default mode
-- Enabling `-w` (sched_waking) can make this worse
+- Minimal overhead in default mode (latency group only)
+- Enabling waking group adds overhead due to high event frequency
+- CPU performance counters (perf group) require hardware support
+- schedstats may impact scheduler performance slightly
+
+## Output Modes
+
+1. **Grouped** (default): Groups processes by latency/performance characteristics
+2. **Collapsed** (default unless `-C` is used): Aggregates all PIDs with same command name
+3. **Detailed** (`-d`): Shows all processes individually
 
 ## License
-GPL-2.0 (with code from the Linux kernel)
+
+GPL-2.0 (includes code from the Linux kernel)
