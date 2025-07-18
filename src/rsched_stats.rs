@@ -855,6 +855,7 @@ impl RschedStats {
         filtered_cpus: &[(u32, &Hist)],
     ) {
         let mut cpu_groups: HashMap<G, Vec<u32>> = HashMap::new();
+        let mut global_hist = Hist::default();
 
         for (cpu, hist) in filtered_cpus {
             let p90 = self.calculate_percentile(hist, 90);
@@ -867,13 +868,14 @@ impl RschedStats {
 
         for (group, mut cpus) in groups {
             cpus.sort();
-            println!("{}: CPUs {}", group.description(), format_cpu_list(&cpus));
+            println!("{}: CPUs ({}) {}", group.description(), cpus.len(), format_cpu_list(&cpus));
 
             // Show aggregate stats
             let mut total_hist = Hist::default();
             for cpu in &cpus {
                 if let Some(hist) = cpu_stats.get(cpu) {
                     total_hist.merge_into(hist);
+                    global_hist.merge_into(hist);
                 }
             }
 
@@ -883,10 +885,19 @@ impl RschedStats {
             let p99 = self.calculate_percentile(&total_hist, 99);
 
             println!(
-                "  Aggregate: p50={:<6} p90={:<6} p99={:<6} count={}\n",
+                "  Group: p50={:<6} p90={:<6} p99={:<6} count={}\n",
                 p50, p90, p99, total_count
             );
         }
+        let total_count = global_hist.total_count();
+        let p50 = self.calculate_percentile(&global_hist, 50);
+        let p90 = self.calculate_percentile(&global_hist, 90);
+        let p99 = self.calculate_percentile(&global_hist, 99);
+
+        println!(
+            "Global: p50={:<6} p90={:<6} p99={:<6} count={}\n",
+            p50, p90, p99, total_count
+        );
     }
 
     fn build_process_entries(&self, filters: &FilterOptions, collapse: bool) -> Vec<ProcessEntry> {

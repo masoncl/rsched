@@ -168,10 +168,12 @@ Very High (>10ms) (1 entries):
 
 ```
 Very Short (<100μs): CPUs 4-15,126-141
-  Aggregate: p50=6      p90=16     p99=39     count=26704057
+  Group: p50=6      p90=16     p99=39     count=26704057
 
 Short (100μs-1ms): CPUs 16-125,142-251
-  Aggregate: p50=73     p90=270    p99=433    count=19646721
+  Group: p50=73     p90=270    p99=433    count=19646721
+
+Global: p50=1194   p90=24824  p99=91466  count=48951
 ```
 
 ### CPU Performance Counters (group: perf)
