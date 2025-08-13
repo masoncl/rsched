@@ -868,7 +868,12 @@ impl RschedStats {
 
         for (group, mut cpus) in groups {
             cpus.sort();
-            println!("{}: CPUs ({}) {}", group.description(), cpus.len(), format_cpu_list(&cpus));
+            println!(
+                "{}: CPUs ({}) {}",
+                group.description(),
+                cpus.len(),
+                format_cpu_list(&cpus)
+            );
 
             // Show aggregate stats
             let mut total_hist = Hist::default();
