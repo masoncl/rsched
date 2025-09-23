@@ -139,8 +139,8 @@ impl CpuMetrics {
         1u64 << 63
     }
 
-    pub fn update(&mut self, cpu_data: HashMap<u32, (CpuPerfData, String)>) {
-        for (pid, (data, comm)) in cpu_data {
+    pub fn update(&mut self, cpu_data: HashMap<u32, (CpuPerfData, String, u64)>) {
+        for (pid, (data, comm, _cgroup_id)) in cpu_data {
             let metrics = self.pid_metrics.entry(pid).or_insert(PidCpuMetrics {
                 user_cycles_hist: Hist::default(),
                 kernel_cycles_hist: Hist::default(),

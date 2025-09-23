@@ -10,8 +10,11 @@ use clap::Parser;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use perf::PerfCounterSetup;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::mem::MaybeUninit;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 // Include the generated skeleton file
@@ -40,6 +43,10 @@ struct Args {
     /// Filter by command name (regex)
     #[arg(short, long)]
     comm: Option<String>,
+
+    /// Filter by cgroup name (regex) - can be specified multiple times
+    #[arg(long)]
+    cgroup: Vec<String>,
 
     /// Filter by specific PID
     #[arg(short, long)]
@@ -107,6 +114,80 @@ fn enable_schedstat() -> Result<()> {
     Ok(())
 }
 
+fn collect_cgroup_children_recursive(path: &Path, cgroup_ids: &mut HashSet<u64>) -> Result<()> {
+    // Get the inode (cgroup ID) of the current directory
+    let metadata = fs::metadata(path)?;
+    let cgroup_id = metadata.ino();
+    cgroup_ids.insert(cgroup_id);
+
+    // Recursively collect all children
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let child_path = entry.path();
+            if child_path.is_dir() {
+                collect_cgroup_children_recursive(&child_path, cgroup_ids)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_cgroup_ids(cgroup_patterns: &[String]) -> Result<HashSet<u64>> {
+    let mut all_cgroup_ids = HashSet::new();
+    let cgroup_root = Path::new("/sys/fs/cgroup");
+
+    for cgroup_pattern in cgroup_patterns {
+        let regex = Regex::new(cgroup_pattern)?;
+        let mut pattern_cgroup_ids = HashSet::new();
+
+        // Handle exact "root" pattern specially - only add root cgroup itself
+        if cgroup_pattern == "root" {
+            let root_metadata = fs::metadata(cgroup_root)?;
+            let root_id = root_metadata.ino();
+            pattern_cgroup_ids.insert(root_id);
+        } else if regex.is_match("root") {
+            // If pattern contains "root" but isn't exactly "root", collect all cgroups
+            collect_cgroup_children_recursive(cgroup_root, &mut pattern_cgroup_ids)?;
+        } else {
+            // Walk through all directories in /sys/fs/cgroup
+            fn walk_cgroups(
+                path: &Path,
+                regex: &Regex,
+                cgroup_ids: &mut HashSet<u64>,
+            ) -> Result<()> {
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    let child_path = entry.path();
+
+                    if child_path.is_dir() {
+                        if let Some(dir_name) = child_path.file_name() {
+                            if let Some(name_str) = dir_name.to_str() {
+                                if regex.is_match(name_str) {
+                                    // This cgroup matches, collect it and all its children
+                                    collect_cgroup_children_recursive(&child_path, cgroup_ids)?;
+                                } else {
+                                    // Continue searching in subdirectories
+                                    walk_cgroups(&child_path, regex, cgroup_ids)?;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            walk_cgroups(cgroup_root, &regex, &mut pattern_cgroup_ids)?;
+        }
+
+        // Merge pattern results into the combined set
+        all_cgroup_ids.extend(pattern_cgroup_ids);
+    }
+
+    Ok(all_cgroup_ids)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -120,10 +201,18 @@ fn main() -> Result<()> {
         .map(|pattern| Regex::new(pattern))
         .transpose()?;
 
+    // resolve cgroup IDs if cgroup filters are specified
+    let cgroup_filter = if !args.cgroup.is_empty() {
+        Some(resolve_cgroup_ids(&args.cgroup)?)
+    } else {
+        None
+    };
+
     println!("Starting rsched");
 
     // Print active options
     if comm_regex.is_some()
+        || !args.cgroup.is_empty()
         || args.pid.is_some()
         || args.min_latency.is_some()
         || args.no_collapse
@@ -133,6 +222,28 @@ fn main() -> Result<()> {
         println!("Options active:");
         if let Some(ref regex) = comm_regex {
             println!("  - Command pattern: {}", regex.as_str());
+        }
+        if !args.cgroup.is_empty() {
+            let count = cgroup_filter.as_ref().map(|s| s.len()).unwrap_or(0);
+            if args.cgroup.len() == 1 {
+                println!(
+                    "  - Cgroup pattern: {} (matched {} cgroups)",
+                    args.cgroup[0], count
+                );
+            } else {
+                println!(
+                    "  - Cgroup patterns: {} (matched {} cgroups)",
+                    args.cgroup.join(", "),
+                    count
+                );
+            }
+
+            // Print the resolved cgroup IDs
+            if let Some(ref cgroup_set) = cgroup_filter {
+                let mut sorted_ids: Vec<u64> = cgroup_set.iter().copied().collect();
+                sorted_ids.sort();
+                println!("  - Resolved cgroup IDs: {:?}", sorted_ids);
+            }
         }
         if let Some(pid) = args.pid {
             println!("  - PID: {}", pid);
@@ -251,6 +362,7 @@ fn main() -> Result<()> {
     let filter_options = FilterOptions {
         comm_regex,
         pid_filter: args.pid,
+        cgroup_filter,
         min_latency_us: args.min_latency.unwrap_or(0),
         metric_groups: metric_groups.clone(),
     };

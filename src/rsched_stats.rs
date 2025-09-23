@@ -4,7 +4,7 @@ use crate::rsched_collector::{Hist, TimesliceStats, MAX_SLOTS};
 use crate::schedstat::SchedstatData;
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // Add these constants to match BPF
 const LINEAR_STEP: u64 = 10;
@@ -32,6 +32,7 @@ pub struct MetricGroups {
 pub struct FilterOptions {
     pub comm_regex: Option<Regex>,
     pub pid_filter: Option<u32>,
+    pub cgroup_filter: Option<HashSet<u64>>,
     pub min_latency_us: u64,
     pub metric_groups: MetricGroups,
 }
@@ -41,6 +42,7 @@ pub struct FilterOptions {
 struct StatsData<T: Clone + Default> {
     data: T,
     comm: String,
+    cgroup_id: u64,
 }
 
 impl<T: Clone + Default> Default for StatsData<T> {
@@ -48,6 +50,7 @@ impl<T: Clone + Default> Default for StatsData<T> {
         Self {
             data: T::default(),
             comm: String::new(),
+            cgroup_id: 0,
         }
     }
 }
@@ -208,20 +211,23 @@ impl RschedStats {
     // Generic update function for histogram-based stats
     fn update_histogram_stats<T: HistogramOps + Clone + Default>(
         stats_map: &mut HashMap<u32, StatsData<T>>,
-        updates: HashMap<u32, (T, String)>,
+        updates: HashMap<u32, (T, String, u64)>,
     ) {
-        for (key, (data, comm)) in updates {
+        for (key, (data, comm, cgroup_id)) in updates {
             let stats = stats_map.entry(key).or_default();
 
             if stats.comm != comm {
                 stats.comm = comm;
+            }
+            if stats.cgroup_id != cgroup_id {
+                stats.cgroup_id = cgroup_id;
             }
 
             stats.data.merge_into(&data);
         }
     }
 
-    pub fn update(&mut self, histograms: HashMap<u32, (Hist, String)>) {
+    pub fn update(&mut self, histograms: HashMap<u32, (Hist, String, u64)>) {
         Self::update_histogram_stats(&mut self.pid_stats, histograms);
     }
 
@@ -244,19 +250,22 @@ impl RschedStats {
         self.schedstat_data = Some(schedstat_data);
     }
 
-    pub fn update_timeslices(&mut self, timeslice_data: HashMap<u32, (TimesliceStats, String)>) {
+    pub fn update_timeslices(
+        &mut self,
+        timeslice_data: HashMap<u32, (TimesliceStats, String, u64)>,
+    ) {
         Self::update_histogram_stats(&mut self.timeslice_stats, timeslice_data);
     }
 
-    pub fn update_nr_running(&mut self, nr_running_data: HashMap<u32, (Hist, String)>) {
+    pub fn update_nr_running(&mut self, nr_running_data: HashMap<u32, (Hist, String, u64)>) {
         Self::update_histogram_stats(&mut self.nr_running_stats, nr_running_data);
     }
 
-    pub fn update_waking_delays(&mut self, waking_delays: HashMap<u32, (Hist, String)>) {
+    pub fn update_waking_delays(&mut self, waking_delays: HashMap<u32, (Hist, String, u64)>) {
         Self::update_histogram_stats(&mut self.waking_delay_stats, waking_delays);
     }
 
-    pub fn update_sleep_durations(&mut self, sleep_durations: HashMap<u32, (Hist, String)>) {
+    pub fn update_sleep_durations(&mut self, sleep_durations: HashMap<u32, (Hist, String, u64)>) {
         Self::update_histogram_stats(&mut self.sleep_duration_stats, sleep_durations);
     }
 
@@ -930,7 +939,7 @@ impl RschedStats {
 
         // Process scheduling delay stats
         for (pid, stats) in &self.pid_stats {
-            if !self.should_include_process(pid, &stats.comm, filters)
+            if !self.should_include_process(pid, &stats.comm, stats.cgroup_id, filters)
                 || stats.data.total_count() == 0
             {
                 continue;
@@ -948,7 +957,7 @@ impl RschedStats {
 
         // Process timeslice stats
         for (pid, ts_data) in &self.timeslice_stats {
-            if !self.should_include_process(pid, &ts_data.comm, filters)
+            if !self.should_include_process(pid, &ts_data.comm, ts_data.cgroup_id, filters)
                 || ts_data.data.total_count() == 0
             {
                 continue;
@@ -966,7 +975,7 @@ impl RschedStats {
 
         // Process nr_running stats
         for (pid, nr_data) in &self.nr_running_stats {
-            if !self.should_include_process(pid, &nr_data.comm, filters)
+            if !self.should_include_process(pid, &nr_data.comm, nr_data.cgroup_id, filters)
                 || nr_data.data.total_count() == 0
             {
                 continue;
@@ -984,7 +993,7 @@ impl RschedStats {
 
         // Process waking delay stats
         for (pid, wd_data) in &self.waking_delay_stats {
-            if !self.should_include_process(pid, &wd_data.comm, filters)
+            if !self.should_include_process(pid, &wd_data.comm, wd_data.cgroup_id, filters)
                 || wd_data.data.total_count() == 0
             {
                 continue;
@@ -1002,7 +1011,7 @@ impl RschedStats {
 
         // Process sleep duration stats
         for (pid, sd_data) in &self.sleep_duration_stats {
-            if !self.should_include_process(pid, &sd_data.comm, filters)
+            if !self.should_include_process(pid, &sd_data.comm, sd_data.cgroup_id, filters)
                 || sd_data.data.total_count() == 0
             {
                 continue;
@@ -1026,7 +1035,7 @@ impl RschedStats {
 
         // Process scheduling delay stats
         for (pid, stats) in &self.pid_stats {
-            if !self.should_include_process(pid, &stats.comm, filters)
+            if !self.should_include_process(pid, &stats.comm, stats.cgroup_id, filters)
                 || stats.data.total_count() == 0
             {
                 continue;
@@ -1042,7 +1051,7 @@ impl RschedStats {
 
         // Process timeslice stats
         for (pid, ts_data) in &self.timeslice_stats {
-            if !self.should_include_process(pid, &ts_data.comm, filters)
+            if !self.should_include_process(pid, &ts_data.comm, ts_data.cgroup_id, filters)
                 || ts_data.data.total_count() == 0
             {
                 continue;
@@ -1058,7 +1067,7 @@ impl RschedStats {
 
         // Process nr_running stats
         for (pid, nr_data) in &self.nr_running_stats {
-            if !self.should_include_process(pid, &nr_data.comm, filters)
+            if !self.should_include_process(pid, &nr_data.comm, nr_data.cgroup_id, filters)
                 || nr_data.data.total_count() == 0
             {
                 continue;
@@ -1074,7 +1083,7 @@ impl RschedStats {
 
         // Process waking delay stats
         for (pid, wd_data) in &self.waking_delay_stats {
-            if !self.should_include_process(pid, &wd_data.comm, filters)
+            if !self.should_include_process(pid, &wd_data.comm, wd_data.cgroup_id, filters)
                 || wd_data.data.total_count() == 0
             {
                 continue;
@@ -1090,7 +1099,7 @@ impl RschedStats {
 
         // Process sleep duration stats
         for (pid, sd_data) in &self.sleep_duration_stats {
-            if !self.should_include_process(pid, &sd_data.comm, filters)
+            if !self.should_include_process(pid, &sd_data.comm, sd_data.cgroup_id, filters)
                 || sd_data.data.total_count() == 0
             {
                 continue;
@@ -1108,7 +1117,13 @@ impl RschedStats {
     }
 
     // Keep existing helper methods
-    fn should_include_process(&self, pid: &u32, comm: &str, filters: &FilterOptions) -> bool {
+    fn should_include_process(
+        &self,
+        pid: &u32,
+        comm: &str,
+        cgroup_id: u64,
+        filters: &FilterOptions,
+    ) -> bool {
         if let Some(filter_pid) = filters.pid_filter {
             if *pid != filter_pid {
                 return false;
@@ -1117,6 +1132,12 @@ impl RschedStats {
 
         if let Some(ref regex) = filters.comm_regex {
             if !regex.is_match(comm) {
+                return false;
+            }
+        }
+
+        if let Some(ref cgroup_set) = filters.cgroup_filter {
+            if !cgroup_set.contains(&cgroup_id) {
                 return false;
             }
         }

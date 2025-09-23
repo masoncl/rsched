@@ -33,21 +33,25 @@ struct timeslice_stats {
 struct hist_data {
 	struct hist hist;
 	char comm[TASK_COMM_LEN];
+	__u64 cgroup_id;
 };
 
 struct timeslice_data {
 	struct timeslice_stats stats;
 	char comm[TASK_COMM_LEN];
+	__u64 cgroup_id;
 };
 
 struct nr_running_data {
 	struct hist hist;
 	char comm[TASK_COMM_LEN];
+	__u64 cgroup_id;
 };
 
 struct waking_data {
 	struct hist hist;
 	char comm[TASK_COMM_LEN];
+	__u64 cgroup_id;
 };
 
 // maps pid->wakeup time from sched_wakeup and sched_wakeup_new tracepoints
@@ -164,6 +168,7 @@ struct cpu_perf_data {
 struct cpu_perf_data_full {
 	struct cpu_perf_data data;
 	char comm[TASK_COMM_LEN];
+	__u64 cgroup_id;
 };
 
 struct cpu_perf_ctx {
@@ -297,6 +302,26 @@ static __always_inline void record_oncpu(__u32 pid, __u64 ts)
 	}
 }
 
+static __always_inline u64 get_current_task_cgroup_id(void)
+{
+	return bpf_get_current_cgroup_id();
+}
+
+static __always_inline u64 get_task_cgroup_id(struct task_struct *task)
+{
+    struct css_set *cgroups;
+    u64 cgroup_id = 0;
+
+    bpf_rcu_read_lock();
+    cgroups = BPF_CORE_READ(task, cgroups);
+    if (cgroups) {
+        cgroup_id = BPF_CORE_READ(cgroups, dfl_cgrp, kn, id);
+    }
+    bpf_rcu_read_unlock();
+
+    return cgroup_id;
+}
+
 /*
  * Calculate histogram slot for a given delay in nanoseconds
  * Using log2 implementation from libbpf-tools/bits.bpf.h
@@ -404,6 +429,7 @@ static __always_inline int handle_wakeup(struct task_struct *p)
 		if (!nr_data)
 			goto check_sleep;
 		read_task_comm(nr_data->comm, p);
+		nr_data->cgroup_id = get_task_cgroup_id(p);
 	}
 	nr_running = bpf_rq_nr_running(rq);
 	if (nr_running < MAX_SLOTS)
@@ -435,6 +461,7 @@ check_sleep:
 					if (sleep_data) {
 						read_task_comm(sleep_data->comm,
 							       p);
+						sleep_data->cgroup_id = get_task_cgroup_id(p);
 					}
 				}
 
@@ -515,8 +542,10 @@ static __always_inline void update_cpu_perf(__u32 prev_pid, __u32 next_pid,
 			data = bpf_map_lookup_elem(&cpu_perf_stats, &prev_pid);
 			if (!data)
 				goto out;
-			if (prev)
+			if (prev) {
 				read_task_comm(data->comm, prev);
+				data->cgroup_id = get_task_cgroup_id(prev);
+			}
 		}
 
 		// User cycles histogram
@@ -604,6 +633,7 @@ static __always_inline void update_timeslices(__u32 next_pid, __u32 prev_pid,
 		if (!ts_data)
 			goto out;
 		read_task_comm(ts_data->comm, prev);
+		ts_data->cgroup_id = get_task_cgroup_id(prev);
 	}
 
 	if (timeslice < 10000000000ULL) { // Skip > 10 seconds
@@ -658,6 +688,7 @@ update_queue_delay(__u32 next_pid, struct task_struct *next, __u64 now)
 		if (!data)
 			goto update_cpu;
 		read_task_comm(data->comm, next);
+	data->cgroup_id = get_task_cgroup_id(next);
 	}
 
 	if (slot < MAX_SLOTS) {
@@ -711,6 +742,7 @@ update_waking_delay(__u32 next_pid, struct task_struct *next, __u64 now)
 		if (!data)
 			return;
 		read_task_comm(data->comm, next);
+	data->cgroup_id = get_task_cgroup_id(next);
 	}
 
 	slot = hist_slot(delay);

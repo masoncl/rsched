@@ -27,6 +27,7 @@ impl Default for Hist {
 pub struct HistData {
     pub hist: Hist,
     pub comm: [u8; TASK_COMM_LEN],
+    pub cgroup_id: u64,
 }
 
 #[repr(C)]
@@ -42,6 +43,7 @@ pub struct TimesliceStats {
 pub struct TimesliceData {
     pub stats: TimesliceStats,
     pub comm: [u8; TASK_COMM_LEN],
+    pub cgroup_id: u64,
 }
 
 #[repr(C)]
@@ -49,6 +51,7 @@ pub struct TimesliceData {
 pub struct CpuPerfDataFull {
     pub data: CpuPerfData,
     pub comm: [u8; TASK_COMM_LEN],
+    pub cgroup_id: u64,
 }
 
 // Helper trait for comm extraction
@@ -63,11 +66,12 @@ impl CommExtractor for [u8; TASK_COMM_LEN] {
     }
 }
 
-// Trait for extracting data with comm
+// Trait for extracting data with comm and cgroup_id
 trait WithComm {
     type Data;
     fn extract_data(&self) -> Self::Data;
     fn extract_comm(&self) -> String;
+    fn extract_cgroup_id(&self) -> u64;
 }
 
 impl WithComm for HistData {
@@ -79,6 +83,10 @@ impl WithComm for HistData {
 
     fn extract_comm(&self) -> String {
         self.comm.comm_str()
+    }
+
+    fn extract_cgroup_id(&self) -> u64 {
+        self.cgroup_id
     }
 }
 
@@ -92,6 +100,10 @@ impl WithComm for TimesliceData {
     fn extract_comm(&self) -> String {
         self.comm.comm_str()
     }
+
+    fn extract_cgroup_id(&self) -> u64 {
+        self.cgroup_id
+    }
 }
 
 impl WithComm for CpuPerfDataFull {
@@ -103,6 +115,10 @@ impl WithComm for CpuPerfDataFull {
 
     fn extract_comm(&self) -> String {
         self.comm.comm_str()
+    }
+
+    fn extract_cgroup_id(&self) -> u64 {
+        self.cgroup_id
     }
 }
 
@@ -137,8 +153,8 @@ impl<'a> RschedCollector<'a> {
         }
     }
 
-    // Generic collection function for data with comm
-    fn collect_with_comm<T, D>(&self, map: &Map) -> Result<HashMap<u32, (D, String)>>
+    // Generic collection function for data with comm and cgroup_id
+    fn collect_with_comm<T, D>(&self, map: &Map) -> Result<HashMap<u32, (D, String, u64)>>
     where
         T: Plain + WithComm<Data = D>,
     {
@@ -151,7 +167,14 @@ impl<'a> RschedCollector<'a> {
 
             if let Some(value) = value {
                 let data = plain::from_bytes::<T>(&value).expect("Invalid data format");
-                results.insert(pid, (data.extract_data(), data.extract_comm()));
+                results.insert(
+                    pid,
+                    (
+                        data.extract_data(),
+                        data.extract_comm(),
+                        data.extract_cgroup_id(),
+                    ),
+                );
             }
 
             let _ = map.delete(&key);
@@ -178,7 +201,7 @@ impl<'a> RschedCollector<'a> {
         Ok(results)
     }
 
-    pub fn collect_histograms(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
+    pub fn collect_histograms(&mut self) -> Result<HashMap<u32, (Hist, String, u64)>> {
         self.collect_with_comm::<HistData, Hist>(self.hists_map)
     }
 
@@ -190,23 +213,25 @@ impl<'a> RschedCollector<'a> {
         self.collect_plain::<Hist>(self.cpu_idle_hists_map)
     }
 
-    pub fn collect_nr_running_hists(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
+    pub fn collect_nr_running_hists(&mut self) -> Result<HashMap<u32, (Hist, String, u64)>> {
         self.collect_with_comm::<HistData, Hist>(self.nr_running_hists_map)
     }
 
-    pub fn collect_waking_delays(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
+    pub fn collect_waking_delays(&mut self) -> Result<HashMap<u32, (Hist, String, u64)>> {
         self.collect_with_comm::<HistData, Hist>(self.waking_delay_map)
     }
 
-    pub fn collect_sleep_durations(&mut self) -> Result<HashMap<u32, (Hist, String)>> {
+    pub fn collect_sleep_durations(&mut self) -> Result<HashMap<u32, (Hist, String, u64)>> {
         self.collect_with_comm::<HistData, Hist>(self.sleep_hists_map)
     }
 
-    pub fn collect_timeslice_stats(&mut self) -> Result<HashMap<u32, (TimesliceStats, String)>> {
+    pub fn collect_timeslice_stats(
+        &mut self,
+    ) -> Result<HashMap<u32, (TimesliceStats, String, u64)>> {
         self.collect_with_comm::<TimesliceData, TimesliceStats>(self.timeslice_hists_map)
     }
 
-    pub fn collect_cpu_perf(&mut self) -> Result<HashMap<u32, (CpuPerfData, String)>> {
+    pub fn collect_cpu_perf(&mut self) -> Result<HashMap<u32, (CpuPerfData, String, u64)>> {
         self.collect_with_comm::<CpuPerfDataFull, CpuPerfData>(self.cpu_perf_map)
     }
 }
