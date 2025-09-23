@@ -40,9 +40,9 @@ struct Args {
     #[arg(short, long)]
     run_time: Option<u64>,
 
-    /// Filter by command name (regex)
+    /// Filter by command name (regex) - can be specified multiple times
     #[arg(short, long)]
-    comm: Option<String>,
+    comm: Vec<String>,
 
     /// Filter by cgroup name (regex) - can be specified multiple times
     #[arg(long)]
@@ -194,12 +194,16 @@ fn main() -> Result<()> {
     // Parse metric groups
     let metric_groups = parse_metric_groups(&args.group)?;
 
-    // command line comm regex
-    let comm_regex = args
-        .comm
-        .as_ref()
-        .map(|pattern| Regex::new(pattern))
-        .transpose()?;
+    // command line comm regexes
+    let comm_regexes = if !args.comm.is_empty() {
+        let mut regexes = Vec::new();
+        for pattern in &args.comm {
+            regexes.push(Regex::new(pattern)?);
+        }
+        Some(regexes)
+    } else {
+        None
+    };
 
     // resolve cgroup IDs if cgroup filters are specified
     let cgroup_filter = if !args.cgroup.is_empty() {
@@ -211,7 +215,7 @@ fn main() -> Result<()> {
     println!("Starting rsched");
 
     // Print active options
-    if comm_regex.is_some()
+    if comm_regexes.is_some()
         || !args.cgroup.is_empty()
         || args.pid.is_some()
         || args.min_latency.is_some()
@@ -220,8 +224,13 @@ fn main() -> Result<()> {
         || args.group != vec!["latency"]
     {
         println!("Options active:");
-        if let Some(ref regex) = comm_regex {
-            println!("  - Command pattern: {}", regex.as_str());
+        if let Some(ref regexes) = comm_regexes {
+            if regexes.len() == 1 {
+                println!("  - Command pattern: {}", regexes[0].as_str());
+            } else {
+                let patterns: Vec<&str> = regexes.iter().map(|r| r.as_str()).collect();
+                println!("  - Command patterns: {}", patterns.join(", "));
+            }
         }
         if !args.cgroup.is_empty() {
             let count = cgroup_filter.as_ref().map(|s| s.len()).unwrap_or(0);
@@ -360,7 +369,7 @@ fn main() -> Result<()> {
     };
 
     let filter_options = FilterOptions {
-        comm_regex,
+        comm_regexes,
         pid_filter: args.pid,
         cgroup_filter,
         min_latency_us: args.min_latency.unwrap_or(0),
@@ -476,7 +485,7 @@ fn main() -> Result<()> {
 
         if let Some(ref mut metrics) = cpu_metrics {
             let cpu_filters = cpu_metrics::CpuFilterOptions {
-                comm_regex: filter_options.comm_regex.clone(),
+                comm_regexes: filter_options.comm_regexes.clone(),
                 pid_filter: filter_options.pid_filter,
                 detailed: args.detailed,
                 collapsed: !args.no_collapse,

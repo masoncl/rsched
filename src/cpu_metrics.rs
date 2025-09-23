@@ -84,7 +84,7 @@ impl PerfGroup {
 }
 
 pub struct CpuFilterOptions {
-    pub comm_regex: Option<Regex>,
+    pub comm_regexes: Option<Vec<Regex>>,
     pub pid_filter: Option<u32>,
     pub detailed: bool,
     pub collapsed: bool,
@@ -512,8 +512,8 @@ impl CpuMetrics {
         }
 
         // Check comm regex filter
-        if let Some(ref regex) = filters.comm_regex {
-            if !regex.is_match(comm) {
+        if let Some(ref regexes) = filters.comm_regexes {
+            if !regexes.iter().any(|regex| regex.is_match(comm)) {
                 return false;
             }
         }

@@ -30,7 +30,7 @@ pub struct MetricGroups {
 }
 
 pub struct FilterOptions {
-    pub comm_regex: Option<Regex>,
+    pub comm_regexes: Option<Vec<Regex>>,
     pub pid_filter: Option<u32>,
     pub cgroup_filter: Option<HashSet<u64>>,
     pub min_latency_us: u64,
@@ -1130,8 +1130,8 @@ impl RschedStats {
             }
         }
 
-        if let Some(ref regex) = filters.comm_regex {
-            if !regex.is_match(comm) {
+        if let Some(ref regexes) = filters.comm_regexes {
+            if !regexes.iter().any(|regex| regex.is_match(comm)) {
                 return false;
             }
         }
