@@ -44,6 +44,10 @@ struct Args {
     #[arg(short, long)]
     comm: Vec<String>,
 
+    /// Global command name filter (regex) - matches regardless of cgroup, OR'd with cgroup results
+    #[arg(long)]
+    global_comm: Vec<String>,
+
     /// Filter by cgroup name (regex) - can be specified multiple times
     #[arg(long)]
     cgroup: Vec<String>,
@@ -205,6 +209,17 @@ fn main() -> Result<()> {
         None
     };
 
+    // global comm regexes (match regardless of cgroup)
+    let global_comm_regexes = if !args.global_comm.is_empty() {
+        let mut regexes = Vec::new();
+        for pattern in &args.global_comm {
+            regexes.push(Regex::new(pattern)?);
+        }
+        Some(regexes)
+    } else {
+        None
+    };
+
     // resolve cgroup IDs if cgroup filters are specified
     let cgroup_filter = if !args.cgroup.is_empty() {
         Some(resolve_cgroup_ids(&args.cgroup)?)
@@ -216,6 +231,7 @@ fn main() -> Result<()> {
 
     // Print active options
     if comm_regexes.is_some()
+        || global_comm_regexes.is_some()
         || !args.cgroup.is_empty()
         || args.pid.is_some()
         || args.min_latency.is_some()
@@ -230,6 +246,14 @@ fn main() -> Result<()> {
             } else {
                 let patterns: Vec<&str> = regexes.iter().map(|r| r.as_str()).collect();
                 println!("  - Command patterns: {}", patterns.join(", "));
+            }
+        }
+        if let Some(ref regexes) = global_comm_regexes {
+            if regexes.len() == 1 {
+                println!("  - Global command pattern: {}", regexes[0].as_str());
+            } else {
+                let patterns: Vec<&str> = regexes.iter().map(|r| r.as_str()).collect();
+                println!("  - Global command patterns: {}", patterns.join(", "));
             }
         }
         if !args.cgroup.is_empty() {
@@ -370,6 +394,7 @@ fn main() -> Result<()> {
 
     let filter_options = FilterOptions {
         comm_regexes,
+        global_comm_regexes,
         pid_filter: args.pid,
         cgroup_filter,
         min_latency_us: args.min_latency.unwrap_or(0),

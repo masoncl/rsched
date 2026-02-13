@@ -31,6 +31,7 @@ pub struct MetricGroups {
 
 pub struct FilterOptions {
     pub comm_regexes: Option<Vec<Regex>>,
+    pub global_comm_regexes: Option<Vec<Regex>>,
     pub pid_filter: Option<u32>,
     pub cgroup_filter: Option<HashSet<u64>>,
     pub min_latency_us: u64,
@@ -1130,15 +1131,25 @@ impl RschedStats {
             }
         }
 
-        if let Some(ref regexes) = filters.comm_regexes {
-            if !regexes.iter().any(|regex| regex.is_match(comm)) {
-                return false;
-            }
-        }
+        // Check if this process matches a global comm pattern (bypasses cgroup filter)
+        let global_comm_match = if let Some(ref regexes) = filters.global_comm_regexes {
+            regexes.iter().any(|regex| regex.is_match(comm))
+        } else {
+            false
+        };
 
-        if let Some(ref cgroup_set) = filters.cgroup_filter {
-            if !cgroup_set.contains(&cgroup_id) {
-                return false;
+        if !global_comm_match {
+            // Normal filtering: comm AND cgroup
+            if let Some(ref regexes) = filters.comm_regexes {
+                if !regexes.iter().any(|regex| regex.is_match(comm)) {
+                    return false;
+                }
+            }
+
+            if let Some(ref cgroup_set) = filters.cgroup_filter {
+                if !cgroup_set.contains(&cgroup_id) {
+                    return false;
+                }
             }
         }
 
