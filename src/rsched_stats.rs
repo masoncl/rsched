@@ -356,6 +356,7 @@ impl RschedStats {
     }
 
     // Generic function to print histogram-based metrics
+    #[allow(clippy::too_many_arguments)]
     fn print_metric_section<F, S>(
         &self,
         entries: &[ProcessEntry],
@@ -1047,7 +1048,7 @@ impl RschedStats {
                 .or_insert_with(|| {
                     Self::create_default_process_entry(stats.comm.clone(), vec![*pid])
                 })
-                .hist = stats.data.clone();
+                .hist = stats.data;
         }
 
         // Process timeslice stats
@@ -1063,7 +1064,7 @@ impl RschedStats {
                 .or_insert_with(|| {
                     Self::create_default_process_entry(ts_data.comm.clone(), vec![*pid])
                 })
-                .timeslice_stats = ts_data.data.clone();
+                .timeslice_stats = ts_data.data;
         }
 
         // Process nr_running stats
@@ -1079,7 +1080,7 @@ impl RschedStats {
                 .or_insert_with(|| {
                     Self::create_default_process_entry(nr_data.comm.clone(), vec![*pid])
                 })
-                .nr_running_hist = nr_data.data.clone();
+                .nr_running_hist = nr_data.data;
         }
 
         // Process waking delay stats
@@ -1095,7 +1096,7 @@ impl RschedStats {
                 .or_insert_with(|| {
                     Self::create_default_process_entry(wd_data.comm.clone(), vec![*pid])
                 })
-                .waking_delay_hist = wd_data.data.clone();
+                .waking_delay_hist = wd_data.data;
         }
 
         // Process sleep duration stats
@@ -1111,7 +1112,7 @@ impl RschedStats {
                 .or_insert_with(|| {
                     Self::create_default_process_entry(sd_data.comm.clone(), vec![*pid])
                 })
-                .sleep_duration_hist = sd_data.data.clone();
+                .sleep_duration_hist = sd_data.data;
         }
 
         pid_entries.into_values().collect()
@@ -1261,7 +1262,7 @@ impl RschedStats {
         let mut metrics: Vec<(&String, &u64)> = schedstat_data.domain_totals.iter().collect();
         metrics.sort_by(|a, b| a.0.cmp(b.0));
 
-        let metrics_per_col = (metrics.len() + 2) / 3;
+        let metrics_per_col = metrics.len().div_ceil(3);
 
         for row in 0..metrics_per_col {
             for col in 0..3 {
@@ -1279,7 +1280,7 @@ impl RschedStats {
 
         if !schedstat_data.cpu_totals.is_empty() {
             println!("\n=== CPU Field Totals (deltas) ===");
-            let cpu_fields = vec![
+            let cpu_fields = [
                 "yld_count",
                 "sched_count",
                 "sched_goidle",
@@ -1294,7 +1295,7 @@ impl RschedStats {
                 if i < schedstat_data.cpu_totals.len() {
                     let mut val = schedstat_data.cpu_totals[i];
                     if *field == "rq_run_delay usec" && i + 1 < schedstat_data.cpu_totals.len() {
-                        val = val / schedstat_data.cpu_totals[i + 1];
+                        val /= schedstat_data.cpu_totals[i + 1];
                     }
                     print!("{:<17} {:>12} ", field, val);
                     if (i + 1) % 3 == 0 {
@@ -1304,7 +1305,7 @@ impl RschedStats {
                     }
                 }
             }
-            if cpu_fields.len() % 3 != 0 {
+            if !cpu_fields.len().is_multiple_of(3) {
                 println!();
             }
         }

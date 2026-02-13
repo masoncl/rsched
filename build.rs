@@ -9,7 +9,7 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set in build script"));
     SkeletonBuilder::new()
         .source(SRC)
-        .build_and_generate(&out.join("rsched.skel.rs"))
+        .build_and_generate(out.join("rsched.skel.rs"))
         .unwrap();
     println!("cargo:rerun-if-changed={}", SRC);
 }

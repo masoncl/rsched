@@ -154,10 +154,12 @@ impl PerfCounterSetup {
         exclude_kernel: bool,
         exclude_user: bool,
     ) -> Result<RawFd> {
-        let mut attr = PerfEventAttr::default();
-        attr.type_ = PERF_TYPE_HARDWARE;
-        attr.size = std::mem::size_of::<PerfEventAttr>() as u32;
-        attr.config = config;
+        let mut attr = PerfEventAttr {
+            type_: PERF_TYPE_HARDWARE,
+            size: std::mem::size_of::<PerfEventAttr>() as u32,
+            config,
+            ..Default::default()
+        };
 
         // Set the exclusion bits in the flags field
         if exclude_kernel {

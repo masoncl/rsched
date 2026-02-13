@@ -261,8 +261,8 @@ impl CpuMetrics {
                 })
                 .map(|(pid, metrics)| CpuProcessEntry {
                     comm: metrics.comm.clone(),
-                    user_cycles_hist: metrics.user_cycles_hist.clone(),
-                    kernel_cycles_hist: metrics.kernel_cycles_hist.clone(),
+                    user_cycles_hist: metrics.user_cycles_hist,
+                    kernel_cycles_hist: metrics.kernel_cycles_hist,
                     total_user_cycles: metrics.total_user_cycles,
                     total_kernel_cycles: metrics.total_kernel_cycles,
                     total_user_instructions: metrics.total_user_instructions,
@@ -462,10 +462,7 @@ impl CpuMetrics {
             let total_p99_mcycles = (user_p99 + kernel_p99) as f64 / 1_000_000.0;
 
             let group = PerfGroup::from_mcycles_per_sec(total_p99_mcycles);
-            perf_groups
-                .entry(group)
-                .or_insert_with(Vec::new)
-                .push(entry);
+            perf_groups.entry(group).or_default().push(entry);
         }
 
         let mut groups: Vec<_> = perf_groups.iter().collect();

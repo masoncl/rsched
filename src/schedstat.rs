@@ -275,7 +275,9 @@ fn parse_cpus(lines: &[String]) -> HashMap<String, Vec<u64>> {
     cpus
 }
 
-fn read_schedstat() -> Result<(u32, Vec<HashMap<String, u64>>, HashMap<String, Vec<u64>>)> {
+type SchedstatRaw = (u32, Vec<HashMap<String, u64>>, HashMap<String, Vec<u64>>);
+
+fn read_schedstat() -> Result<SchedstatRaw> {
     let version = detect_schedstat_version()?;
     let content = fs::read_to_string("/proc/schedstat")?;
     let lines: Vec<String> = content

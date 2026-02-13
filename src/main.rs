@@ -363,7 +363,7 @@ fn main() -> Result<()> {
     };
 
     let maps = &skel.maps;
-    let mut collector = RschedCollector::new(&maps);
+    let mut collector = RschedCollector::new(maps);
     let mut stats = RschedStats::new();
     let mut schedstat_collector = if metric_groups.schedstat {
         enable_schedstat()?;
