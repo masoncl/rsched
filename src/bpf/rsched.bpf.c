@@ -12,6 +12,9 @@
 // command line args
 volatile const unsigned int trace_sched_waking = 0;
 
+// Number of active generic perf event slots (0-8)
+volatile const __u32 num_generic_events = 0;
+
 // CPU topology tables (populated by userspace before load)
 volatile const __s32 cpu_to_die[MAX_CPUS] = {};
 volatile const __s32 cpu_to_numa[MAX_CPUS] = {};
@@ -243,6 +246,92 @@ struct {
 	__uint(value_size, sizeof(__u32));
 	__uint(max_entries, MAX_CPUS);
 } kernel_instructions_array SEC(".maps");
+
+// Generic perf event arrays for user-specified counters (up to 8 events)
+#define MAX_GENERIC_EVENTS 8
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
+} generic_perf_array_0 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
+} generic_perf_array_1 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
+} generic_perf_array_2 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
+} generic_perf_array_3 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
+} generic_perf_array_4 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
+} generic_perf_array_5 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
+} generic_perf_array_6 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, MAX_CPUS);
+} generic_perf_array_7 SEC(".maps");
+
+// Per-PID counters for generic events
+struct generic_perf_data {
+	__u64 counters[MAX_GENERIC_EVENTS];
+	char comm[TASK_COMM_LEN];
+	__u64 cgroup_id;
+};
+
+// Per-CPU context for generic events
+struct generic_perf_ctx {
+	__u64 last_values[MAX_GENERIC_EVENTS];
+	__u32 running_pid;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 10240);
+	__type(key, __u32);
+	__type(value, struct generic_perf_data);
+} generic_perf_stats SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct generic_perf_ctx);
+} generic_perf_context SEC(".maps");
 
 // Helper functions to read from perf arrays
 static __always_inline __u64 read_user_cycles(void)
@@ -607,6 +696,127 @@ out:
 	ctx->running_pid = next_pid;
 }
 
+static __always_inline __u64 read_generic_perf(int slot)
+{
+	__u32 cpu = bpf_get_smp_processor_id();
+	struct bpf_perf_event_value val = {};
+	long ret;
+
+	switch (slot) {
+	case 0:
+		ret = bpf_perf_event_read_value(&generic_perf_array_0, cpu,
+						&val, sizeof(val));
+		break;
+	case 1:
+		ret = bpf_perf_event_read_value(&generic_perf_array_1, cpu,
+						&val, sizeof(val));
+		break;
+	case 2:
+		ret = bpf_perf_event_read_value(&generic_perf_array_2, cpu,
+						&val, sizeof(val));
+		break;
+	case 3:
+		ret = bpf_perf_event_read_value(&generic_perf_array_3, cpu,
+						&val, sizeof(val));
+		break;
+	case 4:
+		ret = bpf_perf_event_read_value(&generic_perf_array_4, cpu,
+						&val, sizeof(val));
+		break;
+	case 5:
+		ret = bpf_perf_event_read_value(&generic_perf_array_5, cpu,
+						&val, sizeof(val));
+		break;
+	case 6:
+		ret = bpf_perf_event_read_value(&generic_perf_array_6, cpu,
+						&val, sizeof(val));
+		break;
+	case 7:
+		ret = bpf_perf_event_read_value(&generic_perf_array_7, cpu,
+						&val, sizeof(val));
+		break;
+	default:
+		return 0;
+	}
+
+	if (ret == 0)
+		return val.counter;
+	return 0;
+}
+
+// Process one generic perf event slot: read current value, compute delta,
+// update per-PID counter and per-CPU context.
+static __always_inline void process_generic_slot(int slot,
+						 struct generic_perf_ctx *ctx,
+						 struct generic_perf_data *data,
+						 __u32 prev_pid)
+{
+	__u64 cur = read_generic_perf(slot);
+
+	if (data && ctx->running_pid == prev_pid && prev_pid != 0) {
+		__u64 delta = 0;
+		if (cur >= ctx->last_values[slot])
+			delta = cur - ctx->last_values[slot];
+		if (delta > 0)
+			__sync_fetch_and_add(&data->counters[slot], delta);
+	}
+
+	ctx->last_values[slot] = cur;
+}
+
+// Update generic perf counters for the previous task
+static __always_inline void update_generic_perf(__u32 prev_pid,
+						__u32 next_pid,
+						struct task_struct *prev)
+{
+	struct generic_perf_ctx *ctx;
+	struct generic_perf_data *data = NULL;
+	__u32 zero_key = 0;
+	__u32 n = num_generic_events;
+
+	if (n == 0)
+		return;
+
+	ctx = bpf_map_lookup_elem(&generic_perf_context, &zero_key);
+	if (!ctx) {
+		struct generic_perf_ctx new_ctx = {};
+		bpf_map_update_elem(&generic_perf_context, &zero_key,
+				    &new_ctx, BPF_ANY);
+		ctx = bpf_map_lookup_elem(&generic_perf_context, &zero_key);
+		if (!ctx)
+			return;
+	}
+
+	// Look up or create per-PID data for the outgoing task
+	if (ctx->running_pid == prev_pid && prev_pid != 0) {
+		data = bpf_map_lookup_elem(&generic_perf_stats, &prev_pid);
+		if (!data) {
+			static struct generic_perf_data new_data = {};
+			bpf_map_update_elem(&generic_perf_stats, &prev_pid,
+					    &new_data, BPF_NOEXIST);
+			data = bpf_map_lookup_elem(&generic_perf_stats,
+						   &prev_pid);
+			if (data && prev) {
+				read_task_comm(data->comm, prev);
+				data->cgroup_id = get_task_cgroup_id(prev);
+			}
+		}
+	}
+
+	// Process each active slot - unrolled to avoid variable-length loops
+	// that cause memcpy issues in BPF
+	if (n > 0) process_generic_slot(0, ctx, data, prev_pid);
+	if (n > 1) process_generic_slot(1, ctx, data, prev_pid);
+	if (n > 2) process_generic_slot(2, ctx, data, prev_pid);
+	if (n > 3) process_generic_slot(3, ctx, data, prev_pid);
+	if (n > 4) process_generic_slot(4, ctx, data, prev_pid);
+	if (n > 5) process_generic_slot(5, ctx, data, prev_pid);
+	if (n > 6) process_generic_slot(6, ctx, data, prev_pid);
+	if (n > 7) process_generic_slot(7, ctx, data, prev_pid);
+
+	ctx->running_pid = next_pid;
+}
+
 // sched_waking, which can happen really a lot.  Try and make it less
 // expensive by checking task state
 static __always_inline int handle_waking(struct task_struct *p)
@@ -858,6 +1068,7 @@ static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
 		bpf_map_delete_elem(&waking_time, &next_pid);
 out:
 	update_cpu_perf(prev_pid, next_pid, prev);
+	update_generic_perf(prev_pid, next_pid, prev);
 	return 0;
 }
 
@@ -917,6 +1128,7 @@ static __always_inline int handle_exit(struct task_struct *p)
 	bpf_map_delete_elem(&nr_running_hists, &pid);
 	bpf_map_delete_elem(&migration_counts, &pid);
 	bpf_map_delete_elem(&cpu_perf_stats, &pid);
+	bpf_map_delete_elem(&generic_perf_stats, &pid);
 	return 0;
 }
 

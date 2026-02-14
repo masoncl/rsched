@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 mod cpu_metrics;
 mod perf;
+mod pmu;
 mod rsched_collector;
 mod rsched_stats;
 mod schedstat;
@@ -83,6 +84,12 @@ struct Args {
 }
 
 fn list_perf_events() -> Result<()> {
+    // Show rsched built-in event aliases first
+    pmu::list_builtin_events();
+    println!();
+
+    // Then show libpfm4 events
+    println!("=== libpfm4 Events ===");
     use pfm_sys::*;
     use std::ffi::CStr;
 
@@ -214,24 +221,28 @@ fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
             }
             s if s == "perf" || s.starts_with("perf=") => {
                 metric_groups.perf = true;
-                let events_str = s.strip_prefix("perf=").unwrap_or("ipc");
-                for event in events_str.split('+') {
-                    match event {
-                        "ipc" => {}
-                        _ => anyhow::bail!(
-                            "Unknown perf event: '{}'. Valid perf events: ipc",
-                            event
-                        ),
-                    }
-                    if !metric_groups.perf_events.contains(&event.to_string()) {
-                        metric_groups.perf_events.push(event.to_string());
-                    }
+                let event = s.strip_prefix("perf=").unwrap_or("ipc");
+                // Validate event by resolving it (will bail with helpful message if invalid)
+                pmu::resolve_event(event)?;
+                if !metric_groups.perf_events.contains(&event.to_string()) {
+                    metric_groups.perf_events.push(event.to_string());
                 }
             }
             "schedstat" => metric_groups.schedstat = true,
             "waking" => metric_groups.waking = true,
             "migration" => metric_groups.migration = true,
-            _ => anyhow::bail!("Unknown metric group: {}. Valid groups are: latency, slice, sleep, perf[=ipc], schedstat, waking, migration, most, all", group),
+            _ => {
+                // Try resolving as a perf event name — allows e.g. -g l2-miss
+                // or -g perf=ipc,l2-miss (clap comma-splits into ["perf=ipc", "l2-miss"])
+                if pmu::resolve_event(group).is_ok() {
+                    metric_groups.perf = true;
+                    if !metric_groups.perf_events.contains(group) {
+                        metric_groups.perf_events.push(group.clone());
+                    }
+                } else {
+                    anyhow::bail!("Unknown metric group: {}. Valid groups are: latency, slice, sleep, perf[=events], schedstat, waking, migration, most, all", group);
+                }
+            }
         }
     }
 
@@ -436,7 +447,7 @@ fn main() -> Result<()> {
             active_groups.push("sleep".to_string());
         }
         if metric_groups.perf {
-            active_groups.push(format!("perf={}", metric_groups.perf_events.join("+")));
+            active_groups.push(format!("perf={}", metric_groups.perf_events.join(",")));
         }
         if metric_groups.schedstat {
             active_groups.push("schedstat".to_string());
@@ -497,13 +508,74 @@ fn main() -> Result<()> {
         None
     };
 
+    // Resolve perf events and determine how many generic slots we need
+    let mut resolved_events: Vec<pmu::PmuEventSet> = Vec::new();
+    let mut generic_event_names: Vec<String> = Vec::new();
+    let mut generic_event_configs: Vec<(u32, u64)> = Vec::new();
+
+    if metric_groups.perf {
+        for event_name in &metric_groups.perf_events {
+            let event_set = pmu::resolve_event(event_name)?;
+            if !event_set.is_ipc {
+                // Each non-IPC event set contributes one generic slot per event
+                for ev in &event_set.events {
+                    generic_event_names.push(event_set.name.clone());
+                    generic_event_configs.push((ev.perf_type, ev.config));
+                }
+            }
+            resolved_events.push(event_set);
+        }
+
+        if generic_event_configs.len() > pmu::MAX_GENERIC_EVENTS {
+            anyhow::bail!(
+                "Too many generic perf events ({}, max {})",
+                generic_event_configs.len(),
+                pmu::MAX_GENERIC_EVENTS
+            );
+        }
+
+        // Set num_generic_events in BPF rodata before load
+        open_skel
+            .maps
+            .rodata_data
+            .as_deref_mut()
+            .unwrap()
+            .num_generic_events = generic_event_configs.len() as u32;
+    }
+
+    let has_ipc = resolved_events.iter().any(|e| e.is_ipc);
+
     let mut skel = open_skel.load()?;
     skel.attach()?;
 
     let _perf_setup = if metric_groups.perf {
         let mut setup = PerfCounterSetup::new();
-        setup.setup_and_attach(&skel.maps)?;
-        println!("CPU performance counters enabled");
+
+        // Setup IPC counters if ipc event is requested
+        if has_ipc {
+            setup.setup_and_attach(&skel.maps)?;
+            println!("CPU performance counters enabled (IPC)");
+        }
+
+        // Setup generic event counters
+        if !generic_event_configs.is_empty() {
+            let generic_maps: Vec<&libbpf_rs::Map> = vec![
+                &skel.maps.generic_perf_array_0,
+                &skel.maps.generic_perf_array_1,
+                &skel.maps.generic_perf_array_2,
+                &skel.maps.generic_perf_array_3,
+                &skel.maps.generic_perf_array_4,
+                &skel.maps.generic_perf_array_5,
+                &skel.maps.generic_perf_array_6,
+                &skel.maps.generic_perf_array_7,
+            ];
+
+            let maps_slice = &generic_maps[..generic_event_configs.len()];
+            setup.setup_generic_events(&generic_event_configs, maps_slice)?;
+
+            println!("Generic perf events: {}", generic_event_names.join(", "));
+        }
+
         Some(setup)
     } else {
         None
@@ -538,7 +610,7 @@ fn main() -> Result<()> {
     };
 
     let mut cpu_metrics = if metric_groups.perf {
-        Some(CpuMetrics::new())
+        Some(CpuMetrics::new(generic_event_names.clone()))
     } else {
         None
     };
@@ -556,9 +628,11 @@ fn main() -> Result<()> {
     let start_time = Instant::now();
     let runtime_limit = args.run_time.map(Duration::from_secs);
 
-    // When migration is active, tick every 1 second to collect per-second
-    // migration counts. Display at the normal interval boundary.
-    let tick_interval = if metric_groups.migration {
+    // When migration or generic perf events are active, tick every 1 second
+    // to collect per-second counts for percentile computation.
+    // Display at the normal interval boundary.
+    let needs_per_second_tick = metric_groups.migration || !generic_event_configs.is_empty();
+    let tick_interval = if needs_per_second_tick {
         Duration::from_secs(1)
     } else {
         Duration::from_secs(args.interval)
@@ -601,14 +675,21 @@ fn main() -> Result<()> {
 
         ticks_since_display += 1;
 
-        // Collect migration counts every tick (every 1 second)
+        // Collect per-second data every tick (every 1 second)
         if metric_groups.migration {
             let migration_counts = collector.collect_migration_counts()?;
             stats.update_migrations(migration_counts);
         }
 
+        if !generic_event_configs.is_empty() {
+            let generic_perf_data = collector.collect_generic_perf()?;
+            if let Some(ref mut metrics) = cpu_metrics {
+                metrics.record_generic_tick(generic_perf_data);
+            }
+        }
+
         // Only do full collection and display at the interval boundary
-        if !metric_groups.migration || ticks_since_display >= args.interval {
+        if !needs_per_second_tick || ticks_since_display >= args.interval {
             ticks_since_display = 0;
 
             // Collect only the data we need based on active metric groups
@@ -659,7 +740,7 @@ fn main() -> Result<()> {
                 stats.update_schedstat(schedstat_data);
             }
 
-            let cpu_perf_data = if metric_groups.perf {
+            let cpu_perf_data = if metric_groups.perf && has_ipc {
                 collector.collect_cpu_perf()?
             } else {
                 HashMap::new()
@@ -674,7 +755,9 @@ fn main() -> Result<()> {
             stats.update_cpu_idle(cpu_idle_histograms);
 
             if let Some(ref mut metrics) = cpu_metrics {
-                metrics.update(cpu_perf_data);
+                if has_ipc {
+                    metrics.update(cpu_perf_data);
+                }
             }
 
             stats.print_summary(output_mode, &filter_options)?;

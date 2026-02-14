@@ -23,6 +23,18 @@ impl Default for Hist {
     }
 }
 
+impl Hist {
+    pub fn merge_from(&mut self, other: &Self) {
+        for i in 0..MAX_SLOTS {
+            self.slots[i] += other.slots[i];
+        }
+    }
+
+    pub fn total_count(&self) -> u64 {
+        self.slots.iter().map(|&c| c as u64).sum()
+    }
+}
+
 #[derive(Clone)]
 pub struct MigHist {
     pub slots: [u32; MIG_HIST_SLOTS],
@@ -103,6 +115,35 @@ pub struct CpuPerfDataFull {
     pub data: CpuPerfData,
     pub comm: [u8; TASK_COMM_LEN],
     pub cgroup_id: u64,
+}
+
+pub const MAX_GENERIC_EVENTS: usize = 8;
+pub type GenericPerfResult = HashMap<u32, ([u64; MAX_GENERIC_EVENTS], String, u64)>;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GenericPerfData {
+    pub counters: [u64; MAX_GENERIC_EVENTS],
+    pub comm: [u8; TASK_COMM_LEN],
+    pub cgroup_id: u64,
+}
+
+unsafe impl Plain for GenericPerfData {}
+
+impl WithComm for GenericPerfData {
+    type Data = [u64; MAX_GENERIC_EVENTS];
+
+    fn extract_data(&self) -> Self::Data {
+        self.counters
+    }
+
+    fn extract_comm(&self) -> String {
+        self.comm.comm_str()
+    }
+
+    fn extract_cgroup_id(&self) -> u64 {
+        self.cgroup_id
+    }
 }
 
 // Helper trait for comm extraction
@@ -190,6 +231,7 @@ pub struct RschedCollector<'a> {
     sleep_hists_map: &'a Map<'a>,
     migration_counts_map: &'a Map<'a>,
     cpu_perf_map: &'a Map<'a>,
+    generic_perf_map: &'a Map<'a>,
 }
 
 impl<'a> RschedCollector<'a> {
@@ -204,6 +246,7 @@ impl<'a> RschedCollector<'a> {
             sleep_hists_map: &maps.sleep_hists,
             migration_counts_map: &maps.migration_counts,
             cpu_perf_map: &maps.cpu_perf_stats,
+            generic_perf_map: &maps.generic_perf_stats,
         }
     }
 
@@ -293,5 +336,9 @@ impl<'a> RschedCollector<'a> {
 
     pub fn collect_cpu_perf(&mut self) -> Result<HashMap<u32, (CpuPerfData, String, u64)>> {
         self.collect_with_comm::<CpuPerfDataFull, CpuPerfData>(self.cpu_perf_map)
+    }
+
+    pub fn collect_generic_perf(&mut self) -> Result<GenericPerfResult> {
+        self.collect_with_comm::<GenericPerfData, [u64; MAX_GENERIC_EVENTS]>(self.generic_perf_map)
     }
 }

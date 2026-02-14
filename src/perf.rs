@@ -234,6 +234,95 @@ impl PerfCounterSetup {
         Ok(fd)
     }
 
+    /// Open a perf event with arbitrary type and config.
+    fn open_typed_perf_event(&self, perf_type: u32, config: u64, cpu: i32) -> Result<RawFd> {
+        let mut attr = PerfEventAttr {
+            type_: perf_type,
+            size: std::mem::size_of::<PerfEventAttr>() as u32,
+            config,
+            ..Default::default()
+        };
+
+        // Exclude hypervisor and idle, but count both user and kernel
+        attr.flags |= PERF_ATTR_BIT_EXCLUDE_HV | PERF_ATTR_BIT_EXCLUDE_IDLE;
+
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_perf_event_open,
+                &attr as *const PerfEventAttr,
+                -1i32 as libc::pid_t,
+                cpu,
+                -1,
+                PERF_FLAG_FD_CLOEXEC,
+            )
+        };
+
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            bail!(
+                "Failed to open perf event (CPU {}, type={}, config=0x{:x}): {}",
+                cpu,
+                perf_type,
+                config,
+                err
+            );
+        }
+
+        let fd = fd as RawFd;
+
+        let ret = unsafe { libc::ioctl(fd, PERF_EVENT_IOC_ENABLE as _, 0) };
+        if ret < 0 {
+            unsafe {
+                libc::close(fd);
+            }
+            bail!(
+                "Failed to enable perf event: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let ret = unsafe { libc::ioctl(fd, PERF_EVENT_IOC_RESET as _, 0) };
+        if ret < 0 {
+            unsafe {
+                libc::close(fd);
+            }
+            bail!(
+                "Failed to reset perf event: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        Ok(fd)
+    }
+
+    /// Setup generic perf events and attach to BPF maps.
+    ///
+    /// `events` is a list of (perf_type, config) pairs for each generic slot.
+    /// `maps` is the list of generic_perf_array_N maps (one per event).
+    pub fn setup_generic_events(&mut self, events: &[(u32, u64)], maps: &[&Map]) -> Result<()> {
+        let num_cpus = num_cpus::get();
+
+        for (slot, ((perf_type, config), map)) in events.iter().zip(maps.iter()).enumerate() {
+            for cpu in 0..num_cpus {
+                let fd = self
+                    .open_typed_perf_event(*perf_type, *config, cpu as i32)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Generic event slot {} on CPU {}: {}", slot, cpu, e)
+                    })?;
+
+                self.attach_to_map(map, cpu, fd)?;
+
+                // Store FD for cleanup
+                while self.fds.len() <= cpu {
+                    self.fds.push(Vec::new());
+                }
+                self.fds[cpu].push(fd);
+            }
+        }
+
+        Ok(())
+    }
+
     fn attach_to_map(&self, map: &Map, cpu: usize, fd: RawFd) -> Result<()> {
         let key_bytes = (cpu as u32).to_ne_bytes();
         let fd_val = fd.to_ne_bytes();

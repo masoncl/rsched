@@ -19,7 +19,25 @@ unsafe impl plain::Plain for CpuPerfData {}
 
 pub struct CpuMetrics {
     pid_metrics: HashMap<u32, PidCpuMetrics>,
+    /// Per-PID log2 histograms of per-second event rates, one Hist per event.
+    generic_pid_hists: HashMap<u32, GenericPidHists>,
+    /// Previous tick's raw counters for delta computation.
+    last_generic_counters: HashMap<u32, Vec<u64>>,
+    generic_event_names: Vec<String>,
     last_update_time: std::time::Instant,
+}
+
+struct GenericPidHists {
+    hists: Vec<Hist>,
+    comm: String,
+    cgroup_id: u64,
+}
+
+#[derive(Clone)]
+struct GenericProcessEntry {
+    comm: String,
+    hists: Vec<Hist>,
+    pids: Vec<u32>,
 }
 
 struct PidCpuMetrics {
@@ -80,9 +98,12 @@ impl PerfGroup {
 }
 
 impl CpuMetrics {
-    pub fn new() -> Self {
+    pub fn new(generic_event_names: Vec<String>) -> Self {
         Self {
             pid_metrics: HashMap::new(),
+            generic_pid_hists: HashMap::new(),
+            last_generic_counters: HashMap::new(),
+            generic_event_names,
             last_update_time: std::time::Instant::now(),
         }
     }
@@ -110,6 +131,53 @@ impl CpuMetrics {
         }
     }
 
+    /// Called every 1-second tick. Computes per-PID deltas from the previous
+    /// tick's counters and records each delta as a sample in a log2 histogram.
+    pub fn record_generic_tick(
+        &mut self,
+        data: HashMap<
+            u32,
+            (
+                [u64; crate::rsched_collector::MAX_GENERIC_EVENTS],
+                String,
+                u64,
+            ),
+        >,
+    ) {
+        let num_events = self.generic_event_names.len();
+
+        for (pid, (counters, comm, cgroup_id)) in data {
+            // Look up or create histogram entry
+            let hists = self
+                .generic_pid_hists
+                .entry(pid)
+                .or_insert_with(|| GenericPidHists {
+                    hists: vec![Hist::default(); num_events],
+                    comm: comm.clone(),
+                    cgroup_id,
+                });
+            hists.comm.clone_from(&comm);
+            hists.cgroup_id = cgroup_id;
+
+            // Compute deltas from previous tick
+            if let Some(prev) = self.last_generic_counters.get(&pid) {
+                for i in 0..num_events {
+                    let delta = counters[i].saturating_sub(prev[i]);
+                    if delta > 0 {
+                        let slot = log2_slot(delta);
+                        if slot < crate::rsched_collector::MAX_SLOTS {
+                            hists.hists[i].slots[slot] += 1;
+                        }
+                    }
+                }
+            }
+
+            // Store current counters for next tick
+            self.last_generic_counters
+                .insert(pid, counters[..num_events].to_vec());
+        }
+    }
+
     pub fn print_summary(&mut self, output_mode: OutputMode, filters: &FilterOptions) {
         let now = std::time::Instant::now();
         let elapsed_secs = now.duration_since(self.last_update_time).as_secs_f64();
@@ -122,29 +190,34 @@ impl CpuMetrics {
         let collapsed = matches!(output_mode, OutputMode::Collapsed);
         let detailed = matches!(output_mode, OutputMode::Detailed);
 
-        // Build process entries based on collapse mode
-        let process_entries = self.build_process_entries(filters, collapsed, detailed);
+        // IPC section (only when pid_metrics has data)
+        if !self.pid_metrics.is_empty() {
+            let process_entries = self.build_process_entries(filters, collapsed, detailed);
 
-        if process_entries.is_empty() {
             println!("\n=== CPU Performance Metrics ===");
-            println!("No processes match the specified filters for CPU metrics.\n");
-            return;
+
+            if process_entries.is_empty() {
+                println!("No processes match the specified filters for CPU metrics.\n");
+            } else {
+                Self::print_global_metrics(&process_entries, elapsed_secs);
+
+                if detailed {
+                    Self::print_detailed_metrics(&process_entries, collapsed, elapsed_secs);
+                } else {
+                    Self::print_grouped_metrics(&process_entries, collapsed, elapsed_secs);
+                }
+            }
         }
 
-        println!("\n=== CPU Performance Metrics ===");
-
-        // Calculate and print global metrics
-        Self::print_global_metrics(&process_entries, elapsed_secs);
-
-        // Print process-level metrics
-        if detailed {
-            Self::print_detailed_metrics(&process_entries, collapsed, elapsed_secs);
-        } else {
-            Self::print_grouped_metrics(&process_entries, collapsed, elapsed_secs);
+        // Generic event sections (independent of IPC)
+        if !self.generic_event_names.is_empty() {
+            self.print_generic_event_metrics(output_mode, filters, elapsed_secs);
         }
 
         // Clear incremental data for next interval
         self.pid_metrics.clear();
+        self.generic_pid_hists.clear();
+        self.last_generic_counters.clear();
     }
 
     fn build_process_entries(
@@ -375,6 +448,180 @@ impl CpuMetrics {
         }
     }
 
+    fn print_generic_event_metrics(
+        &self,
+        output_mode: OutputMode,
+        filters: &FilterOptions,
+        _elapsed_secs: f64,
+    ) {
+        let collapsed = matches!(output_mode, OutputMode::Collapsed);
+        let detailed = matches!(output_mode, OutputMode::Detailed);
+        let num_events = self.generic_event_names.len();
+
+        for event_idx in 0..num_events {
+            let event_name = &self.generic_event_names[event_idx];
+            println!("\n=== {} (per second) ===", event_name);
+
+            let entries = self.build_generic_entries(filters, collapsed, event_idx);
+
+            let entries_with_data: Vec<&GenericProcessEntry> = entries
+                .iter()
+                .filter(|e| e.hists[0].total_count() > 0)
+                .collect();
+
+            if entries_with_data.is_empty() {
+                println!("No data.\n");
+                continue;
+            }
+
+            if detailed {
+                let mut sorted = entries_with_data;
+                sorted.sort_by(|a, b| {
+                    let a_p90 = log2_percentile(&a.hists[0], 90);
+                    let b_p90 = log2_percentile(&b.hists[0], 90);
+                    b_p90.cmp(&a_p90)
+                });
+
+                Self::print_generic_table(&sorted, collapsed);
+            } else {
+                let mut sorted = entries_with_data;
+                sorted.sort_by(|a, b| {
+                    let a_p90 = log2_percentile(&a.hists[0], 90);
+                    let b_p90 = log2_percentile(&b.hists[0], 90);
+                    b_p90.cmp(&a_p90)
+                });
+
+                let show_count = sorted.len().min(20);
+                let table_entries: Vec<&GenericProcessEntry> =
+                    sorted.iter().take(show_count).copied().collect();
+
+                Self::print_generic_table(&table_entries, collapsed);
+
+                if sorted.len() > show_count {
+                    println!("  ... and {} more\n", sorted.len() - show_count);
+                }
+            }
+        }
+    }
+
+    fn print_generic_table(entries: &[&GenericProcessEntry], collapsed: bool) {
+        let max_comm_len = entries
+            .iter()
+            .map(|e| e.comm.len())
+            .max()
+            .unwrap_or(7)
+            .max(7);
+
+        if collapsed {
+            println!(
+                "  {:<width$} {:<8} {:<12} {:<12} {:<12} {:<10}",
+                "COMMAND",
+                "PROCS",
+                "p50/s",
+                "p90/s",
+                "p99/s",
+                "SAMPLES",
+                width = max_comm_len
+            );
+        } else {
+            println!(
+                "  {:<8} {:<width$} {:<12} {:<12} {:<12} {:<10}",
+                "PID",
+                "COMMAND",
+                "p50/s",
+                "p90/s",
+                "p99/s",
+                "SAMPLES",
+                width = max_comm_len
+            );
+        }
+
+        for entry in entries {
+            let hist = &entry.hists[0];
+            let total = hist.total_count();
+            if total == 0 {
+                continue;
+            }
+
+            let p50 = log2_percentile(hist, 50);
+            let p90 = log2_percentile(hist, 90);
+            let p99 = log2_percentile(hist, 99);
+
+            if collapsed {
+                println!(
+                    "  {:<width$} {:<8} {:<12} {:<12} {:<12} {:<10}",
+                    &entry.comm,
+                    entry.pids.len(),
+                    format_rate(p50 as f64),
+                    format_rate(p90 as f64),
+                    format_rate(p99 as f64),
+                    total,
+                    width = max_comm_len
+                );
+            } else {
+                println!(
+                    "  {:<8} {:<width$} {:<12} {:<12} {:<12} {:<10}",
+                    entry.pids[0],
+                    &entry.comm,
+                    format_rate(p50 as f64),
+                    format_rate(p90 as f64),
+                    format_rate(p99 as f64),
+                    total,
+                    width = max_comm_len
+                );
+            }
+        }
+        println!();
+    }
+
+    fn build_generic_entries(
+        &self,
+        filters: &FilterOptions,
+        collapsed: bool,
+        event_idx: usize,
+    ) -> Vec<GenericProcessEntry> {
+        if collapsed {
+            let mut comm_map: HashMap<String, GenericProcessEntry> = HashMap::new();
+
+            for (pid, ph) in &self.generic_pid_hists {
+                if !Self::should_include_process(pid, &ph.comm, ph.cgroup_id, filters) {
+                    continue;
+                }
+                if event_idx >= ph.hists.len() {
+                    continue;
+                }
+
+                let entry = comm_map
+                    .entry(ph.comm.clone())
+                    .or_insert(GenericProcessEntry {
+                        comm: ph.comm.clone(),
+                        hists: vec![Hist::default()],
+                        pids: Vec::new(),
+                    });
+
+                entry.hists[0].merge_from(&ph.hists[event_idx]);
+                entry.pids.push(*pid);
+            }
+
+            comm_map.into_values().collect()
+        } else {
+            self.generic_pid_hists
+                .iter()
+                .filter(|(pid, ph)| {
+                    Self::should_include_process(pid, &ph.comm, ph.cgroup_id, filters)
+                })
+                .filter(|(_, ph)| {
+                    event_idx < ph.hists.len() && ph.hists[event_idx].total_count() > 0
+                })
+                .map(|(pid, ph)| GenericProcessEntry {
+                    comm: ph.comm.clone(),
+                    hists: vec![ph.hists[event_idx]],
+                    pids: vec![*pid],
+                })
+                .collect()
+        }
+    }
+
     fn should_include_process(
         pid: &u32,
         comm: &str,
@@ -435,6 +682,40 @@ impl CpuMetrics {
             )
         }
     }
+}
+
+/// Compute log2 slot index for a value (mirrors BPF log2_slot).
+fn log2_slot(v: u64) -> usize {
+    if v == 0 {
+        return 0;
+    }
+    let slot = 63 - v.leading_zeros() as usize;
+    if slot < crate::rsched_collector::MAX_SLOTS {
+        slot
+    } else {
+        crate::rsched_collector::MAX_SLOTS - 1
+    }
+}
+
+/// Compute a percentile from a log2-indexed histogram.
+/// Returns the value at the bucket boundary (2^slot).
+fn log2_percentile(hist: &Hist, percentile: u8) -> u64 {
+    let total = hist.total_count();
+    if total == 0 {
+        return 0;
+    }
+
+    let target = (total * percentile as u64) / 100;
+    let mut cumulative = 0u64;
+
+    for (slot, &count) in hist.slots.iter().enumerate() {
+        cumulative += count as u64;
+        if cumulative >= target {
+            return 1u64 << slot;
+        }
+    }
+
+    0
 }
 
 fn format_rate(value: f64) -> String {
