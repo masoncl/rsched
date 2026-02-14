@@ -68,6 +68,98 @@ struct Args {
     /// Select metric groups to display (comma-separated: latency,slice,sleep,perf[=events],schedstat,waking,migration,most,all)
     #[arg(short = 'g', long, default_value = "latency", value_delimiter = ',')]
     group: Vec<String>,
+
+    /// List available performance counters and exit
+    #[arg(long)]
+    perf_list: bool,
+}
+
+fn list_perf_events() -> Result<()> {
+    use pfm_sys::*;
+    use std::ffi::CStr;
+
+    unsafe {
+        let ret = pfm_initialize();
+        if ret != PFM_SUCCESS {
+            anyhow::bail!("Failed to initialize libpfm4");
+        }
+    }
+
+    for pmu_id in 0..pfm_pmu_t::PFM_PMU_MAX as u32 {
+        let mut pmu_info: pfm_pmu_info_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        pmu_info.size = std::mem::size_of::<pfm_pmu_info_t>();
+
+        let pmu: pfm_pmu_t = unsafe { std::mem::transmute(pmu_id) };
+        let ret = unsafe { pfm_get_pmu_info(pmu, &mut pmu_info) };
+        if ret != PFM_SUCCESS {
+            continue;
+        }
+
+        // Skip PMUs not present on this system
+        if pmu_info.__bindgen_anon_1.is_present() == 0 {
+            continue;
+        }
+
+        let pmu_name = if !pmu_info.name.is_null() {
+            unsafe { CStr::from_ptr(pmu_info.name) }
+                .to_str()
+                .unwrap_or("?")
+        } else {
+            "?"
+        };
+
+        let pmu_desc = if !pmu_info.desc.is_null() {
+            unsafe { CStr::from_ptr(pmu_info.desc) }
+                .to_str()
+                .unwrap_or("")
+        } else {
+            ""
+        };
+
+        println!(
+            "PMU: {} - {} ({} events)",
+            pmu_name, pmu_desc, pmu_info.nevents
+        );
+
+        // Iterate events for this PMU
+        let mut idx = pmu_info.first_event;
+        while idx >= 0 {
+            let mut event_info: pfm_event_info_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            event_info.size = std::mem::size_of::<pfm_event_info_t>();
+
+            let ret =
+                unsafe { pfm_get_event_info(idx, pfm_os_t::PFM_OS_PERF_EVENT, &mut event_info) };
+            if ret != PFM_SUCCESS {
+                break;
+            }
+
+            let name = if !event_info.name.is_null() {
+                unsafe { CStr::from_ptr(event_info.name) }
+                    .to_str()
+                    .unwrap_or("?")
+            } else {
+                "?"
+            };
+
+            let desc = if !event_info.desc.is_null() {
+                unsafe { CStr::from_ptr(event_info.desc) }
+                    .to_str()
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+
+            println!("  {:<40} {}", name, desc);
+
+            idx = unsafe { pfm_get_event_next(idx) };
+        }
+    }
+
+    unsafe {
+        pfm_terminate();
+    }
+
+    Ok(())
 }
 
 fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
@@ -219,6 +311,10 @@ fn resolve_cgroup_ids(cgroup_patterns: &[String]) -> Result<HashSet<u64>> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.perf_list {
+        return list_perf_events();
+    }
 
     // Parse metric groups
     let metric_groups = parse_metric_groups(&args.group)?;

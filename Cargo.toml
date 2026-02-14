@@ -13,6 +13,8 @@ clap = { version = "4.0", features = ["derive"] }
 regex = "1.7"
 num_cpus = "1.17"
 atty = "0.2"
+pfm = "0.1.2"
+pfm-sys = "0.0.18"
 
 [build-dependencies]
 libbpf-cargo = "0.25.0"
