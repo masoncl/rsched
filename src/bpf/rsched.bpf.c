@@ -12,6 +12,10 @@
 // command line args
 volatile const unsigned int trace_sched_waking = 0;
 
+// CPU topology tables (populated by userspace before load)
+volatile const __s32 cpu_to_die[MAX_CPUS] = {};
+volatile const __s32 cpu_to_numa[MAX_CPUS] = {};
+
 // histogram defines
 #define MAX_SLOTS 64
 #define LINEAR_THRESHOLD 500 // Use linear buckets up to 500μs
@@ -50,6 +54,8 @@ struct nr_running_data {
 
 struct migration_data {
 	__u64 count;
+	__u64 cross_ccx_count;
+	__u64 cross_numa_count;
 	char comm[TASK_COMM_LEN];
 	__u64 cgroup_id;
 };
@@ -855,7 +861,7 @@ out:
 	return 0;
 }
 
-static __always_inline int handle_migrate(struct task_struct *p)
+static __always_inline int handle_migrate(struct task_struct *p, int dest_cpu)
 {
 	__u32 pid = BPF_CORE_READ(p, pid);
 	if (!pid)
@@ -875,6 +881,23 @@ static __always_inline int handle_migrate(struct task_struct *p)
 	}
 
 	__sync_fetch_and_add(&data->count, 1);
+
+	int orig_cpu = bpf_task_cpu(p);
+	if (orig_cpu < 0 || orig_cpu >= MAX_CPUS ||
+	    dest_cpu < 0 || dest_cpu >= MAX_CPUS)
+		return 0;
+
+	__s32 orig_numa = cpu_to_numa[orig_cpu];
+	__s32 dest_numa = cpu_to_numa[dest_cpu];
+	if (orig_numa >= 0 && dest_numa >= 0 && orig_numa != dest_numa) {
+		__sync_fetch_and_add(&data->cross_numa_count, 1);
+	} else {
+		__s32 orig_die = cpu_to_die[orig_cpu];
+		__s32 dest_die = cpu_to_die[dest_cpu];
+		if (orig_die >= 0 && dest_die >= 0 && orig_die != dest_die)
+			__sync_fetch_and_add(&data->cross_ccx_count, 1);
+	}
+
 	return 0;
 }
 
@@ -950,13 +973,13 @@ int BPF_PROG(handle_sched_switch_raw, bool preempt, struct task_struct *prev,
 SEC("tp_btf/sched_migrate_task")
 int BPF_PROG(handle_sched_migrate_task_btf, struct task_struct *p, int dest_cpu)
 {
-	return handle_migrate(p);
+	return handle_migrate(p, dest_cpu);
 }
 
 SEC("raw_tp/sched_migrate_task")
 int BPF_PROG(handle_sched_migrate_task_raw, struct task_struct *p, int dest_cpu)
 {
-	return handle_migrate(p);
+	return handle_migrate(p, dest_cpu);
 }
 
 SEC("raw_tp/sched_process_exit")

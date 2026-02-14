@@ -54,6 +54,13 @@ C program and generate Rust skeleton bindings at build time.
 - `perf`: Hardware performance counters (user/kernel cycles and instructions,
   IPC)
 - `schedstat`: System-wide `/proc/schedstat` load balancing and CPU counters
+- `migration`: CPU migration tracking via `sched_migrate_task` tracepoint.
+  Counts migrations per second per process, with p50/p90/p99 of the
+  per-second rates. Detects CPU topology at startup (die/CCX from sysfs
+  `die_id`/`physical_package_id`, NUMA from `/sys/devices/system/node`)
+  and classifies migrations as cross-CCX (different die, same NUMA node)
+  or cross-NUMA (different NUMA node). Uses 1-second collection ticks
+  regardless of display interval to capture burstiness.
 - `waking`: Waking delay (sched_waking-to-switch), gated by command line flag
   for overhead reduction
 - `most`: All except waking

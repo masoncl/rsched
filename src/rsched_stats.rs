@@ -1,6 +1,6 @@
 // src/rsched_stats.rs
 // SPDX-License-Identifier: GPL-2.0
-use crate::rsched_collector::{Hist, TimesliceStats, MAX_SLOTS};
+use crate::rsched_collector::{Hist, MigrationCounts, TimesliceStats, MAX_SLOTS};
 use crate::schedstat::SchedstatData;
 use anyhow::Result;
 use regex::Regex;
@@ -71,7 +71,11 @@ pub struct RschedStats {
     waking_delay_stats: HashMap<u32, HistogramStats>,
     sleep_duration_stats: HashMap<u32, HistogramStats>,
     migration_stats: HashMap<u32, HistogramStats>,
+    migration_ccx_stats: HashMap<u32, HistogramStats>,
+    migration_numa_stats: HashMap<u32, HistogramStats>,
     schedstat_data: Option<SchedstatData>,
+    pub num_dies: usize,
+    pub num_numa_nodes: usize,
 }
 
 // Represents either a single process or a collapsed group of processes
@@ -83,6 +87,8 @@ struct ProcessEntry {
     waking_delay_hist: Hist,
     sleep_duration_hist: Hist,
     migration_hist: Hist,
+    migration_ccx_hist: Hist,
+    migration_numa_hist: Hist,
     pids: Vec<u32>,
 }
 
@@ -209,7 +215,11 @@ impl RschedStats {
             waking_delay_stats: HashMap::new(),
             sleep_duration_stats: HashMap::new(),
             migration_stats: HashMap::new(),
+            migration_ccx_stats: HashMap::new(),
+            migration_numa_stats: HashMap::new(),
             schedstat_data: None,
+            num_dies: 0,
+            num_numa_nodes: 0,
         }
     }
 
@@ -277,21 +287,28 @@ impl RschedStats {
     /// Update migration stats from raw counts collected over a 1-second period.
     /// Each PID's count becomes one sample in a linear histogram (slot = count,
     /// capped at MAX_SLOTS-1), giving us a distribution of migrations-per-second.
-    pub fn update_migrations(&mut self, counts: HashMap<u32, (u64, String, u64)>) {
-        for (pid, (count, comm, cgroup_id)) in counts {
-            let stats = self.migration_stats.entry(pid).or_default();
-            if stats.comm != comm {
-                stats.comm = comm;
-            }
-            if stats.cgroup_id != cgroup_id {
-                stats.cgroup_id = cgroup_id;
-            }
-            let slot = if (count as usize) < MAX_SLOTS {
-                count as usize
-            } else {
-                MAX_SLOTS - 1
+    pub fn update_migrations(&mut self, counts: HashMap<u32, (MigrationCounts, String, u64)>) {
+        for (pid, (mig, comm, cgroup_id)) in counts {
+            // Helper to record a count into a histogram stats entry
+            let record = |stats_map: &mut HashMap<u32, HistogramStats>, count: u64| {
+                let stats = stats_map.entry(pid).or_default();
+                if stats.comm != comm {
+                    stats.comm = comm.clone();
+                }
+                if stats.cgroup_id != cgroup_id {
+                    stats.cgroup_id = cgroup_id;
+                }
+                let slot = if (count as usize) < MAX_SLOTS {
+                    count as usize
+                } else {
+                    MAX_SLOTS - 1
+                };
+                stats.data.slots[slot] += 1;
             };
-            stats.data.slots[slot] += 1;
+
+            record(&mut self.migration_stats, mig.total);
+            record(&mut self.migration_ccx_stats, mig.cross_ccx);
+            record(&mut self.migration_numa_stats, mig.cross_numa);
         }
     }
 
@@ -365,6 +382,30 @@ impl RschedStats {
 
         if filters.metric_groups.migration {
             self.print_migration_stats(&process_entries, detailed, collapsed)?;
+
+            if self.num_dies > 1 {
+                self.print_migration_type_stats(
+                    &process_entries,
+                    detailed,
+                    collapsed,
+                    "Cross-CCX Migration Statistics",
+                    "cross-die migrations per second",
+                    "cross-CCX migration rate",
+                    |e| &e.migration_ccx_hist,
+                )?;
+            }
+
+            if self.num_numa_nodes > 1 {
+                self.print_migration_type_stats(
+                    &process_entries,
+                    detailed,
+                    collapsed,
+                    "Cross-NUMA Migration Statistics",
+                    "cross-node migrations per second",
+                    "cross-NUMA migration rate",
+                    |e| &e.migration_numa_hist,
+                )?;
+            }
         }
 
         if filters.metric_groups.schedstat {
@@ -784,6 +825,64 @@ impl RschedStats {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn print_migration_type_stats<F>(
+        &self,
+        entries: &[ProcessEntry],
+        detailed: bool,
+        collapsed: bool,
+        title_base: &str,
+        subtitle: &str,
+        sort_label: &str,
+        hist_getter: F,
+    ) -> Result<()>
+    where
+        F: Fn(&ProcessEntry) -> &Hist + Copy,
+    {
+        let title = if collapsed {
+            format!("Collapsed {}", title_base)
+        } else {
+            format!("Per-Process {}", title_base)
+        };
+
+        println!("=== {} ({}) ===\n", title, subtitle);
+
+        let entries_with_data: Vec<&ProcessEntry> = entries
+            .iter()
+            .filter(|e| hist_getter(e).total_count() > 0)
+            .collect();
+
+        if entries_with_data.is_empty() {
+            println!("No {} data collected yet.\n", sort_label);
+            return Ok(());
+        }
+
+        if detailed {
+            self.print_nr_running_table_with_hist(&entries_with_data, collapsed, hist_getter);
+        } else {
+            println!("Processes by {}:\n", sort_label);
+
+            let mut sorted_entries = entries_with_data;
+            sorted_entries.sort_by(|a, b| {
+                let a_p90 = self.calculate_nr_running_percentile(hist_getter(a), 90);
+                let b_p90 = self.calculate_nr_running_percentile(hist_getter(b), 90);
+                b_p90.cmp(&a_p90)
+            });
+
+            let show_count = sorted_entries.len().min(10);
+            let table_entries: Vec<&ProcessEntry> =
+                sorted_entries.iter().take(show_count).copied().collect();
+
+            self.print_nr_running_table_with_hist(&table_entries, collapsed, hist_getter);
+
+            if sorted_entries.len() > show_count {
+                println!("  ... and {} more\n", sorted_entries.len() - show_count);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Generic table printer for linear-indexed histograms (nr_running, migration, etc.)
     fn print_nr_running_table_with_hist<F>(
         &self,
@@ -1025,6 +1124,8 @@ impl RschedStats {
             waking_delay_hist: Hist::default(),
             sleep_duration_hist: Hist::default(),
             migration_hist: Hist::default(),
+            migration_ccx_hist: Hist::default(),
+            migration_numa_hist: Hist::default(),
             pids,
         }
     }
@@ -1140,6 +1241,42 @@ impl RschedStats {
             }
         }
 
+        // Process migration CCX stats
+        for (pid, mig_data) in &self.migration_ccx_stats {
+            if !self.should_include_process(pid, &mig_data.comm, mig_data.cgroup_id, filters)
+                || mig_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            let entry = comm_map.entry(mig_data.comm.clone()).or_insert_with(|| {
+                Self::create_default_process_entry(mig_data.comm.clone(), Vec::new())
+            });
+
+            entry.migration_ccx_hist.merge_into(&mig_data.data);
+            if !entry.pids.contains(pid) {
+                entry.pids.push(*pid);
+            }
+        }
+
+        // Process migration NUMA stats
+        for (pid, mig_data) in &self.migration_numa_stats {
+            if !self.should_include_process(pid, &mig_data.comm, mig_data.cgroup_id, filters)
+                || mig_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            let entry = comm_map.entry(mig_data.comm.clone()).or_insert_with(|| {
+                Self::create_default_process_entry(mig_data.comm.clone(), Vec::new())
+            });
+
+            entry.migration_numa_hist.merge_into(&mig_data.data);
+            if !entry.pids.contains(pid) {
+                entry.pids.push(*pid);
+            }
+        }
+
         comm_map.into_values().collect()
     }
 
@@ -1240,6 +1377,38 @@ impl RschedStats {
                     Self::create_default_process_entry(mig_data.comm.clone(), vec![*pid])
                 })
                 .migration_hist = mig_data.data;
+        }
+
+        // Process migration CCX stats
+        for (pid, mig_data) in &self.migration_ccx_stats {
+            if !self.should_include_process(pid, &mig_data.comm, mig_data.cgroup_id, filters)
+                || mig_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            pid_entries
+                .entry(*pid)
+                .or_insert_with(|| {
+                    Self::create_default_process_entry(mig_data.comm.clone(), vec![*pid])
+                })
+                .migration_ccx_hist = mig_data.data;
+        }
+
+        // Process migration NUMA stats
+        for (pid, mig_data) in &self.migration_numa_stats {
+            if !self.should_include_process(pid, &mig_data.comm, mig_data.cgroup_id, filters)
+                || mig_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            pid_entries
+                .entry(*pid)
+                .or_insert_with(|| {
+                    Self::create_default_process_entry(mig_data.comm.clone(), vec![*pid])
+                })
+                .migration_numa_hist = mig_data.data;
         }
 
         pid_entries.into_values().collect()

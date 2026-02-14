@@ -4,6 +4,7 @@ mod perf;
 mod rsched_collector;
 mod rsched_stats;
 mod schedstat;
+mod topology;
 
 use anyhow::Result;
 use clap::Parser;
@@ -358,7 +359,18 @@ fn main() -> Result<()> {
         open_skel.progs.handle_sched_waking_raw.set_autoload(false);
     }
 
-    if !metric_groups.migration {
+    let topo = if metric_groups.migration {
+        let topo = topology::detect_topology()?;
+        topology::print_topology(&topo);
+
+        let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();
+        for i in 0..topology::MAX_CPUS {
+            rodata.cpu_to_die[i] = topo.cpu_to_die[i];
+            rodata.cpu_to_numa[i] = topo.cpu_to_numa[i];
+        }
+
+        Some(topo)
+    } else {
         open_skel
             .progs
             .handle_sched_migrate_task_btf
@@ -367,7 +379,8 @@ fn main() -> Result<()> {
             .progs
             .handle_sched_migrate_task_raw
             .set_autoload(false);
-    }
+        None
+    };
 
     let mut skel = open_skel.load()?;
     skel.attach()?;
@@ -384,6 +397,10 @@ fn main() -> Result<()> {
     let maps = &skel.maps;
     let mut collector = RschedCollector::new(maps);
     let mut stats = RschedStats::new();
+    if let Some(ref topo) = topo {
+        stats.num_dies = topo.num_dies;
+        stats.num_numa_nodes = topo.num_numa_nodes;
+    }
     let mut schedstat_collector = if metric_groups.schedstat {
         enable_schedstat()?;
         Some(SchedstatCollector::new()?)

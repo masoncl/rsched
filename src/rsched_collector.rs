@@ -46,19 +46,32 @@ pub struct TimesliceData {
     pub cgroup_id: u64,
 }
 
+#[derive(Copy, Clone, Default)]
+pub struct MigrationCounts {
+    pub total: u64,
+    pub cross_ccx: u64,
+    pub cross_numa: u64,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct MigrationData {
     pub count: u64,
+    pub cross_ccx_count: u64,
+    pub cross_numa_count: u64,
     pub comm: [u8; TASK_COMM_LEN],
     pub cgroup_id: u64,
 }
 
 impl WithComm for MigrationData {
-    type Data = u64;
+    type Data = MigrationCounts;
 
     fn extract_data(&self) -> Self::Data {
-        self.count
+        MigrationCounts {
+            total: self.count,
+            cross_ccx: self.cross_ccx_count,
+            cross_numa: self.cross_numa_count,
+        }
     }
 
     fn extract_comm(&self) -> String {
@@ -258,8 +271,10 @@ impl<'a> RschedCollector<'a> {
         self.collect_with_comm::<TimesliceData, TimesliceStats>(self.timeslice_hists_map)
     }
 
-    pub fn collect_migration_counts(&mut self) -> Result<HashMap<u32, (u64, String, u64)>> {
-        self.collect_with_comm::<MigrationData, u64>(self.migration_counts_map)
+    pub fn collect_migration_counts(
+        &mut self,
+    ) -> Result<HashMap<u32, (MigrationCounts, String, u64)>> {
+        self.collect_with_comm::<MigrationData, MigrationCounts>(self.migration_counts_map)
     }
 
     pub fn collect_cpu_perf(&mut self) -> Result<HashMap<u32, (CpuPerfData, String, u64)>> {
