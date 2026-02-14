@@ -48,6 +48,12 @@ struct nr_running_data {
 	__u64 cgroup_id;
 };
 
+struct migration_data {
+	__u64 count;
+	char comm[TASK_COMM_LEN];
+	__u64 cgroup_id;
+};
+
 struct waking_data {
 	struct hist hist;
 	char comm[TASK_COMM_LEN];
@@ -154,6 +160,14 @@ struct {
 	__type(value,
 	       struct nr_running_data); // Distribution of nr_running values
 } nr_running_hists SEC(".maps");
+
+// migration count per PID (sched_migrate_task tracepoint)
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 10240);
+	__type(key, __u32);
+	__type(value, struct migration_data);
+} migration_counts SEC(".maps");
 
 struct cpu_perf_data {
 	struct hist user_cycles_hist;
@@ -841,6 +855,29 @@ out:
 	return 0;
 }
 
+static __always_inline int handle_migrate(struct task_struct *p)
+{
+	__u32 pid = BPF_CORE_READ(p, pid);
+	if (!pid)
+		return 0;
+
+	struct migration_data *data =
+		bpf_map_lookup_elem(&migration_counts, &pid);
+	if (!data) {
+		static struct migration_data new_data = {};
+		bpf_map_update_elem(&migration_counts, &pid, &new_data,
+				    BPF_NOEXIST);
+		data = bpf_map_lookup_elem(&migration_counts, &pid);
+		if (!data)
+			return 0;
+		read_task_comm(data->comm, p);
+		data->cgroup_id = get_task_cgroup_id(p);
+	}
+
+	__sync_fetch_and_add(&data->count, 1);
+	return 0;
+}
+
 static __always_inline int handle_exit(struct task_struct *p)
 {
 	__u32 pid = BPF_CORE_READ(p, pid);
@@ -855,6 +892,7 @@ static __always_inline int handle_exit(struct task_struct *p)
 	bpf_map_delete_elem(&sleep_hists, &pid);
 	bpf_map_delete_elem(&timeslice_hists, &pid);
 	bpf_map_delete_elem(&nr_running_hists, &pid);
+	bpf_map_delete_elem(&migration_counts, &pid);
 	bpf_map_delete_elem(&cpu_perf_stats, &pid);
 	return 0;
 }
@@ -907,6 +945,18 @@ int BPF_PROG(handle_sched_switch_raw, bool preempt, struct task_struct *prev,
 	     struct task_struct *next)
 {
 	return handle_switch(preempt, prev, next);
+}
+
+SEC("tp_btf/sched_migrate_task")
+int BPF_PROG(handle_sched_migrate_task_btf, struct task_struct *p, int dest_cpu)
+{
+	return handle_migrate(p);
+}
+
+SEC("raw_tp/sched_migrate_task")
+int BPF_PROG(handle_sched_migrate_task_raw, struct task_struct *p, int dest_cpu)
+{
+	return handle_migrate(p);
 }
 
 SEC("raw_tp/sched_process_exit")

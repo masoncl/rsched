@@ -48,6 +48,30 @@ pub struct TimesliceData {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct MigrationData {
+    pub count: u64,
+    pub comm: [u8; TASK_COMM_LEN],
+    pub cgroup_id: u64,
+}
+
+impl WithComm for MigrationData {
+    type Data = u64;
+
+    fn extract_data(&self) -> Self::Data {
+        self.count
+    }
+
+    fn extract_comm(&self) -> String {
+        self.comm.comm_str()
+    }
+
+    fn extract_cgroup_id(&self) -> u64 {
+        self.cgroup_id
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct CpuPerfDataFull {
     pub data: CpuPerfData,
     pub comm: [u8; TASK_COMM_LEN],
@@ -126,6 +150,7 @@ unsafe impl Plain for Hist {}
 unsafe impl Plain for HistData {}
 unsafe impl Plain for TimesliceStats {}
 unsafe impl Plain for TimesliceData {}
+unsafe impl Plain for MigrationData {}
 unsafe impl Plain for CpuPerfDataFull {}
 
 pub struct RschedCollector<'a> {
@@ -136,6 +161,7 @@ pub struct RschedCollector<'a> {
     nr_running_hists_map: &'a Map<'a>,
     waking_delay_map: &'a Map<'a>,
     sleep_hists_map: &'a Map<'a>,
+    migration_counts_map: &'a Map<'a>,
     cpu_perf_map: &'a Map<'a>,
 }
 
@@ -149,6 +175,7 @@ impl<'a> RschedCollector<'a> {
             nr_running_hists_map: &maps.nr_running_hists,
             waking_delay_map: &maps.waking_delay,
             sleep_hists_map: &maps.sleep_hists,
+            migration_counts_map: &maps.migration_counts,
             cpu_perf_map: &maps.cpu_perf_stats,
         }
     }
@@ -229,6 +256,10 @@ impl<'a> RschedCollector<'a> {
         &mut self,
     ) -> Result<HashMap<u32, (TimesliceStats, String, u64)>> {
         self.collect_with_comm::<TimesliceData, TimesliceStats>(self.timeslice_hists_map)
+    }
+
+    pub fn collect_migration_counts(&mut self) -> Result<HashMap<u32, (u64, String, u64)>> {
+        self.collect_with_comm::<MigrationData, u64>(self.migration_counts_map)
     }
 
     pub fn collect_cpu_perf(&mut self) -> Result<HashMap<u32, (CpuPerfData, String, u64)>> {

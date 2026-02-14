@@ -64,7 +64,7 @@ struct Args {
     #[arg(short = 'C', long)]
     no_collapse: bool,
 
-    /// Select metric groups to display (comma-separated: latency,slice,sleep,perf,schedstat,waking,most,all)
+    /// Select metric groups to display (comma-separated: latency,slice,sleep,perf,schedstat,waking,migration,most,all)
     #[arg(short = 'g', long, default_value = "latency", value_delimiter = ',')]
     group: Vec<String>,
 }
@@ -83,6 +83,7 @@ fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
                 metric_groups.perf = true;
                 metric_groups.schedstat = true;
                 metric_groups.waking = true;
+                metric_groups.migration = true;
             }
             "most" => {
                 // just all minus waking
@@ -93,6 +94,7 @@ fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
                 metric_groups.cpu_idle = true;
                 metric_groups.perf = true;
                 metric_groups.schedstat = true;
+                metric_groups.migration = true;
             }
             "latency" => {
                 metric_groups.latency = true;
@@ -106,7 +108,8 @@ fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
             "perf" => metric_groups.perf = true,
             "schedstat" => metric_groups.schedstat = true,
             "waking" => metric_groups.waking = true,
-            _ => anyhow::bail!("Unknown metric group: {}. Valid groups are: latency, slice, sleep, perf, schedstat, waking, most, all", group),
+            "migration" => metric_groups.migration = true,
+            _ => anyhow::bail!("Unknown metric group: {}. Valid groups are: latency, slice, sleep, perf, schedstat, waking, migration, most, all", group),
         }
     }
 
@@ -323,6 +326,11 @@ fn main() -> Result<()> {
             } else {
                 None
             },
+            if metric_groups.migration {
+                Some("migration")
+            } else {
+                None
+            },
         ]
         .into_iter()
         .flatten()
@@ -348,6 +356,17 @@ fn main() -> Result<()> {
         // Disable both BTF and raw tracepoint versions to reduce overhead
         open_skel.progs.handle_sched_waking_btf.set_autoload(false);
         open_skel.progs.handle_sched_waking_raw.set_autoload(false);
+    }
+
+    if !metric_groups.migration {
+        open_skel
+            .progs
+            .handle_sched_migrate_task_btf
+            .set_autoload(false);
+        open_skel
+            .progs
+            .handle_sched_migrate_task_raw
+            .set_autoload(false);
     }
 
     let mut skel = open_skel.load()?;
@@ -405,6 +424,15 @@ fn main() -> Result<()> {
     let start_time = Instant::now();
     let runtime_limit = args.run_time.map(Duration::from_secs);
 
+    // When migration is active, tick every 1 second to collect per-second
+    // migration counts. Display at the normal interval boundary.
+    let tick_interval = if metric_groups.migration {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(args.interval)
+    };
+    let mut ticks_since_display = 0u64;
+
     loop {
         // Check runtime limit
         if let Some(limit) = runtime_limit {
@@ -418,10 +446,9 @@ fn main() -> Result<()> {
         let sleep_duration = if let Some(limit) = runtime_limit {
             let elapsed = start_time.elapsed();
             let remaining = limit.saturating_sub(elapsed);
-            let interval = Duration::from_secs(args.interval);
-            std::cmp::min(remaining, interval)
+            std::cmp::min(remaining, tick_interval)
         } else {
-            Duration::from_secs(args.interval)
+            tick_interval
         };
 
         // Sleep for the calculated duration
@@ -440,82 +467,95 @@ fn main() -> Result<()> {
             }
         }
 
-        // Collect only the data we need based on active metric groups
-        let histograms = if metric_groups.latency {
-            collector.collect_histograms()?
-        } else {
-            HashMap::new()
-        };
+        ticks_since_display += 1;
 
-        let cpu_histograms = if metric_groups.cpu_latency {
-            collector.collect_cpu_histograms()?
-        } else {
-            HashMap::new()
-        };
-
-        let timeslice_stats = if metric_groups.slice {
-            collector.collect_timeslice_stats()?
-        } else {
-            HashMap::new()
-        };
-
-        let nr_running_hists = if metric_groups.latency {
-            collector.collect_nr_running_hists()?
-        } else {
-            HashMap::new()
-        };
-
-        let waking_delays = if metric_groups.waking {
-            collector.collect_waking_delays()?
-        } else {
-            HashMap::new()
-        };
-
-        let sleep_durations = if metric_groups.sleep {
-            collector.collect_sleep_durations()?
-        } else {
-            HashMap::new()
-        };
-
-        let cpu_idle_histograms = if metric_groups.cpu_idle {
-            collector.collect_cpu_idle_histograms()?
-        } else {
-            HashMap::new()
-        };
-
-        if let Some(ref mut schedstat) = schedstat_collector {
-            let schedstat_data = schedstat.collect()?;
-            stats.update_schedstat(schedstat_data);
+        // Collect migration counts every tick (every 1 second)
+        if metric_groups.migration {
+            let migration_counts = collector.collect_migration_counts()?;
+            stats.update_migrations(migration_counts);
         }
 
-        let cpu_perf_data = if metric_groups.perf {
-            collector.collect_cpu_perf()?
-        } else {
-            HashMap::new()
-        };
+        // Only do full collection and display at the interval boundary
+        if !metric_groups.migration || ticks_since_display >= args.interval {
+            ticks_since_display = 0;
 
-        stats.update(histograms);
-        stats.update_cpu(cpu_histograms);
-        stats.update_timeslices(timeslice_stats);
-        stats.update_nr_running(nr_running_hists);
-        stats.update_waking_delays(waking_delays);
-        stats.update_sleep_durations(sleep_durations);
-        stats.update_cpu_idle(cpu_idle_histograms);
-
-        if let Some(ref mut metrics) = cpu_metrics {
-            metrics.update(cpu_perf_data);
-        }
-
-        stats.print_summary(output_mode, &filter_options)?;
-
-        if let Some(ref mut metrics) = cpu_metrics {
-            let cpu_filters = cpu_metrics::CpuFilterOptions {
-                comm_regexes: filter_options.comm_regexes.clone(),
-                pid_filter: filter_options.pid_filter,
-                detailed: args.detailed,
-                collapsed: !args.no_collapse,
+            // Collect only the data we need based on active metric groups
+            let histograms = if metric_groups.latency {
+                collector.collect_histograms()?
+            } else {
+                HashMap::new()
             };
-            metrics.print_summary(&cpu_filters);
+
+            let cpu_histograms = if metric_groups.cpu_latency {
+                collector.collect_cpu_histograms()?
+            } else {
+                HashMap::new()
+            };
+
+            let timeslice_stats = if metric_groups.slice {
+                collector.collect_timeslice_stats()?
+            } else {
+                HashMap::new()
+            };
+
+            let nr_running_hists = if metric_groups.latency {
+                collector.collect_nr_running_hists()?
+            } else {
+                HashMap::new()
+            };
+
+            let waking_delays = if metric_groups.waking {
+                collector.collect_waking_delays()?
+            } else {
+                HashMap::new()
+            };
+
+            let sleep_durations = if metric_groups.sleep {
+                collector.collect_sleep_durations()?
+            } else {
+                HashMap::new()
+            };
+
+            let cpu_idle_histograms = if metric_groups.cpu_idle {
+                collector.collect_cpu_idle_histograms()?
+            } else {
+                HashMap::new()
+            };
+
+            if let Some(ref mut schedstat) = schedstat_collector {
+                let schedstat_data = schedstat.collect()?;
+                stats.update_schedstat(schedstat_data);
+            }
+
+            let cpu_perf_data = if metric_groups.perf {
+                collector.collect_cpu_perf()?
+            } else {
+                HashMap::new()
+            };
+
+            stats.update(histograms);
+            stats.update_cpu(cpu_histograms);
+            stats.update_timeslices(timeslice_stats);
+            stats.update_nr_running(nr_running_hists);
+            stats.update_waking_delays(waking_delays);
+            stats.update_sleep_durations(sleep_durations);
+            stats.update_cpu_idle(cpu_idle_histograms);
+
+            if let Some(ref mut metrics) = cpu_metrics {
+                metrics.update(cpu_perf_data);
+            }
+
+            stats.print_summary(output_mode, &filter_options)?;
+
+            if let Some(ref mut metrics) = cpu_metrics {
+                let cpu_filters = cpu_metrics::CpuFilterOptions {
+                    comm_regexes: filter_options.comm_regexes.clone(),
+                    pid_filter: filter_options.pid_filter,
+                    detailed: args.detailed,
+                    collapsed: !args.no_collapse,
+                };
+                metrics.print_summary(&cpu_filters);
+            }
         }
     }
 

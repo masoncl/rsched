@@ -27,6 +27,7 @@ pub struct MetricGroups {
     pub perf: bool,
     pub schedstat: bool,
     pub waking: bool,
+    pub migration: bool,
 }
 
 pub struct FilterOptions {
@@ -69,6 +70,7 @@ pub struct RschedStats {
     nr_running_stats: HashMap<u32, HistogramStats>,
     waking_delay_stats: HashMap<u32, HistogramStats>,
     sleep_duration_stats: HashMap<u32, HistogramStats>,
+    migration_stats: HashMap<u32, HistogramStats>,
     schedstat_data: Option<SchedstatData>,
 }
 
@@ -80,6 +82,7 @@ struct ProcessEntry {
     nr_running_hist: Hist,
     waking_delay_hist: Hist,
     sleep_duration_hist: Hist,
+    migration_hist: Hist,
     pids: Vec<u32>,
 }
 
@@ -205,6 +208,7 @@ impl RschedStats {
             nr_running_stats: HashMap::new(),
             waking_delay_stats: HashMap::new(),
             sleep_duration_stats: HashMap::new(),
+            migration_stats: HashMap::new(),
             schedstat_data: None,
         }
     }
@@ -270,6 +274,27 @@ impl RschedStats {
         Self::update_histogram_stats(&mut self.sleep_duration_stats, sleep_durations);
     }
 
+    /// Update migration stats from raw counts collected over a 1-second period.
+    /// Each PID's count becomes one sample in a linear histogram (slot = count,
+    /// capped at MAX_SLOTS-1), giving us a distribution of migrations-per-second.
+    pub fn update_migrations(&mut self, counts: HashMap<u32, (u64, String, u64)>) {
+        for (pid, (count, comm, cgroup_id)) in counts {
+            let stats = self.migration_stats.entry(pid).or_default();
+            if stats.comm != comm {
+                stats.comm = comm;
+            }
+            if stats.cgroup_id != cgroup_id {
+                stats.cgroup_id = cgroup_id;
+            }
+            let slot = if (count as usize) < MAX_SLOTS {
+                count as usize
+            } else {
+                MAX_SLOTS - 1
+            };
+            stats.data.slots[slot] += 1;
+        }
+    }
+
     pub fn print_summary(&self, mode: OutputMode, filters: &FilterOptions) -> Result<()> {
         // Clear screen for better readability only if stdout is a TTY
         if atty::is(atty::Stream::Stdout) {
@@ -286,7 +311,8 @@ impl RschedStats {
             && (filters.metric_groups.latency
                 || filters.metric_groups.slice
                 || filters.metric_groups.sleep
-                || filters.metric_groups.waking)
+                || filters.metric_groups.waking
+                || filters.metric_groups.migration)
         {
             println!("No processes match the specified filters.\n");
         }
@@ -335,6 +361,10 @@ impl RschedStats {
 
         if filters.metric_groups.latency {
             self.print_nr_running_stats(&process_entries, detailed, collapsed)?;
+        }
+
+        if filters.metric_groups.migration {
+            self.print_migration_stats(&process_entries, detailed, collapsed)?;
         }
 
         if filters.metric_groups.schedstat {
@@ -699,7 +729,70 @@ impl RschedStats {
     }
 
     fn print_nr_running_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
-        // Use the generic histogram table printer with nr_running percentile calculation
+        self.print_nr_running_table_with_hist(entries, collapsed, |e| &e.nr_running_hist);
+    }
+
+    fn print_migration_stats(
+        &self,
+        entries: &[ProcessEntry],
+        detailed: bool,
+        collapsed: bool,
+    ) -> Result<()> {
+        let title = if collapsed {
+            "Collapsed Migration Statistics"
+        } else {
+            "Per-Process Migration Statistics"
+        };
+
+        println!("=== {} (migrations per second) ===\n", title);
+
+        let entries_with_data: Vec<&ProcessEntry> = entries
+            .iter()
+            .filter(|e| e.migration_hist.total_count() > 0)
+            .collect();
+
+        if entries_with_data.is_empty() {
+            println!("No migration data collected yet.\n");
+            return Ok(());
+        }
+
+        if detailed {
+            self.print_nr_running_table_with_hist(&entries_with_data, collapsed, |e| {
+                &e.migration_hist
+            });
+        } else {
+            println!("Processes by migration rate:\n");
+
+            let mut sorted_entries = entries_with_data;
+            sorted_entries.sort_by(|a, b| {
+                let a_p90 = self.calculate_nr_running_percentile(&a.migration_hist, 90);
+                let b_p90 = self.calculate_nr_running_percentile(&b.migration_hist, 90);
+                b_p90.cmp(&a_p90)
+            });
+
+            let show_count = sorted_entries.len().min(10);
+            let table_entries: Vec<&ProcessEntry> =
+                sorted_entries.iter().take(show_count).copied().collect();
+
+            self.print_nr_running_table_with_hist(&table_entries, collapsed, |e| &e.migration_hist);
+
+            if sorted_entries.len() > show_count {
+                println!("  ... and {} more\n", sorted_entries.len() - show_count);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Generic table printer for linear-indexed histograms (nr_running, migration, etc.)
+    fn print_nr_running_table_with_hist<F>(
+        &self,
+        entries: &[&ProcessEntry],
+        collapsed: bool,
+        hist_getter: F,
+    ) where
+        F: Fn(&ProcessEntry) -> &Hist,
+    {
         let max_comm_len = entries
             .iter()
             .map(|e| e.comm.len())
@@ -707,7 +800,6 @@ impl RschedStats {
             .unwrap_or(7)
             .max(7);
 
-        // Print header
         if collapsed {
             println!(
                 "  {:<width$} {:<8} {:<10} {:<10} {:<10} {:<12}",
@@ -732,16 +824,16 @@ impl RschedStats {
             );
         }
 
-        // Print rows with nr_running specific percentile calculation
         for entry in entries {
-            let total_count = entry.nr_running_hist.total_count();
+            let hist = hist_getter(entry);
+            let total_count = hist.total_count();
             if total_count == 0 {
                 continue;
             }
 
-            let p50 = self.calculate_nr_running_percentile(&entry.nr_running_hist, 50);
-            let p90 = self.calculate_nr_running_percentile(&entry.nr_running_hist, 90);
-            let p99 = self.calculate_nr_running_percentile(&entry.nr_running_hist, 99);
+            let p50 = self.calculate_nr_running_percentile(hist, 50);
+            let p90 = self.calculate_nr_running_percentile(hist, 90);
+            let p99 = self.calculate_nr_running_percentile(hist, 99);
 
             if collapsed {
                 println!(
@@ -932,6 +1024,7 @@ impl RschedStats {
             nr_running_hist: Hist::default(),
             waking_delay_hist: Hist::default(),
             sleep_duration_hist: Hist::default(),
+            migration_hist: Hist::default(),
             pids,
         }
     }
@@ -1029,6 +1122,24 @@ impl RschedStats {
             }
         }
 
+        // Process migration stats
+        for (pid, mig_data) in &self.migration_stats {
+            if !self.should_include_process(pid, &mig_data.comm, mig_data.cgroup_id, filters)
+                || mig_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            let entry = comm_map.entry(mig_data.comm.clone()).or_insert_with(|| {
+                Self::create_default_process_entry(mig_data.comm.clone(), Vec::new())
+            });
+
+            entry.migration_hist.merge_into(&mig_data.data);
+            if !entry.pids.contains(pid) {
+                entry.pids.push(*pid);
+            }
+        }
+
         comm_map.into_values().collect()
     }
 
@@ -1113,6 +1224,22 @@ impl RschedStats {
                     Self::create_default_process_entry(sd_data.comm.clone(), vec![*pid])
                 })
                 .sleep_duration_hist = sd_data.data;
+        }
+
+        // Process migration stats
+        for (pid, mig_data) in &self.migration_stats {
+            if !self.should_include_process(pid, &mig_data.comm, mig_data.cgroup_id, filters)
+                || mig_data.data.total_count() == 0
+            {
+                continue;
+            }
+
+            pid_entries
+                .entry(*pid)
+                .or_insert_with(|| {
+                    Self::create_default_process_entry(mig_data.comm.clone(), vec![*pid])
+                })
+                .migration_hist = mig_data.data;
         }
 
         pid_entries.into_values().collect()
