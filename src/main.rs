@@ -72,6 +72,14 @@ struct Args {
     /// List available performance counters and exit
     #[arg(long)]
     perf_list: bool,
+
+    /// Load CPU topology from JSON file instead of detecting from sysfs
+    #[arg(long)]
+    topology: Option<String>,
+
+    /// Detect CPU topology and print as JSON, then exit
+    #[arg(long)]
+    gen_topology: bool,
 }
 
 fn list_perf_events() -> Result<()> {
@@ -316,6 +324,10 @@ fn main() -> Result<()> {
         return list_perf_events();
     }
 
+    if args.gen_topology {
+        return topology::gen_topology();
+    }
+
     // Parse metric groups
     let metric_groups = parse_metric_groups(&args.group)?;
 
@@ -459,7 +471,11 @@ fn main() -> Result<()> {
     }
 
     let topo = if metric_groups.migration {
-        let topo = topology::detect_topology()?;
+        let topo = if let Some(ref path) = args.topology {
+            topology::load_topology(path)?
+        } else {
+            topology::detect_topology()?
+        };
         topology::print_topology(&topo);
 
         let rodata = open_skel.maps.rodata_data.as_deref_mut().unwrap();

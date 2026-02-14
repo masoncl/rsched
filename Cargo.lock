@@ -700,6 +700,8 @@ dependencies = [
  "pfm-sys",
  "plain",
  "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
