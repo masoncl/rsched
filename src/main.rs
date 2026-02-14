@@ -65,7 +65,7 @@ struct Args {
     #[arg(short = 'C', long)]
     no_collapse: bool,
 
-    /// Select metric groups to display (comma-separated: latency,slice,sleep,perf,schedstat,waking,migration,most,all)
+    /// Select metric groups to display (comma-separated: latency,slice,sleep,perf[=events],schedstat,waking,migration,most,all)
     #[arg(short = 'g', long, default_value = "latency", value_delimiter = ',')]
     group: Vec<String>,
 }
@@ -82,6 +82,9 @@ fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
                 metric_groups.sleep = true;
                 metric_groups.cpu_idle = true;
                 metric_groups.perf = true;
+                if metric_groups.perf_events.is_empty() {
+                    metric_groups.perf_events.push("ipc".to_string());
+                }
                 metric_groups.schedstat = true;
                 metric_groups.waking = true;
                 metric_groups.migration = true;
@@ -94,6 +97,9 @@ fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
                 metric_groups.sleep = true;
                 metric_groups.cpu_idle = true;
                 metric_groups.perf = true;
+                if metric_groups.perf_events.is_empty() {
+                    metric_groups.perf_events.push("ipc".to_string());
+                }
                 metric_groups.schedstat = true;
                 metric_groups.migration = true;
             }
@@ -106,11 +112,26 @@ fn parse_metric_groups(groups: &[String]) -> Result<MetricGroups> {
                 metric_groups.sleep = true;
                 metric_groups.cpu_idle = true;
             }
-            "perf" => metric_groups.perf = true,
+            s if s == "perf" || s.starts_with("perf=") => {
+                metric_groups.perf = true;
+                let events_str = s.strip_prefix("perf=").unwrap_or("ipc");
+                for event in events_str.split('+') {
+                    match event {
+                        "ipc" => {}
+                        _ => anyhow::bail!(
+                            "Unknown perf event: '{}'. Valid perf events: ipc",
+                            event
+                        ),
+                    }
+                    if !metric_groups.perf_events.contains(&event.to_string()) {
+                        metric_groups.perf_events.push(event.to_string());
+                    }
+                }
+            }
             "schedstat" => metric_groups.schedstat = true,
             "waking" => metric_groups.waking = true,
             "migration" => metric_groups.migration = true,
-            _ => anyhow::bail!("Unknown metric group: {}. Valid groups are: latency, slice, sleep, perf, schedstat, waking, migration, most, all", group),
+            _ => anyhow::bail!("Unknown metric group: {}. Valid groups are: latency, slice, sleep, perf[=ipc], schedstat, waking, migration, most, all", group),
         }
     }
 
@@ -296,46 +317,28 @@ fn main() -> Result<()> {
         }
 
         // Print active metric groups
-        let active_groups: Vec<&str> = vec![
-            if metric_groups.latency {
-                Some("latency")
-            } else {
-                None
-            },
-            if metric_groups.slice {
-                Some("slice")
-            } else {
-                None
-            },
-            if metric_groups.sleep {
-                Some("sleep")
-            } else {
-                None
-            },
-            if metric_groups.perf {
-                Some("perf")
-            } else {
-                None
-            },
-            if metric_groups.schedstat {
-                Some("schedstat")
-            } else {
-                None
-            },
-            if metric_groups.waking {
-                Some("waking")
-            } else {
-                None
-            },
-            if metric_groups.migration {
-                Some("migration")
-            } else {
-                None
-            },
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let mut active_groups: Vec<String> = Vec::new();
+        if metric_groups.latency {
+            active_groups.push("latency".to_string());
+        }
+        if metric_groups.slice {
+            active_groups.push("slice".to_string());
+        }
+        if metric_groups.sleep {
+            active_groups.push("sleep".to_string());
+        }
+        if metric_groups.perf {
+            active_groups.push(format!("perf={}", metric_groups.perf_events.join("+")));
+        }
+        if metric_groups.schedstat {
+            active_groups.push("schedstat".to_string());
+        }
+        if metric_groups.waking {
+            active_groups.push("waking".to_string());
+        }
+        if metric_groups.migration {
+            active_groups.push("migration".to_string());
+        }
 
         if !active_groups.is_empty() {
             println!("  - Metric groups: {}", active_groups.join(", "));

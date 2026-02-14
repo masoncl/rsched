@@ -25,6 +25,7 @@ pub struct MetricGroups {
     pub sleep: bool,
     pub cpu_idle: bool,
     pub perf: bool,
+    pub perf_events: Vec<String>,
     pub schedstat: bool,
     pub waking: bool,
     pub migration: bool,

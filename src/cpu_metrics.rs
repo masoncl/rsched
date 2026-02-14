@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-use crate::rsched_collector::{Hist, MAX_SLOTS};
+use crate::rsched_collector::Hist;
 use crate::rsched_stats::{FilterOptions, OutputMode};
 use std::collections::HashMap;
 
@@ -23,13 +23,10 @@ pub struct CpuMetrics {
 }
 
 struct PidCpuMetrics {
-    user_cycles_hist: Hist,
-    kernel_cycles_hist: Hist,
     total_user_cycles: u64,
     total_kernel_cycles: u64,
     total_user_instructions: u64,
     total_kernel_instructions: u64,
-    sample_count: u64,
     comm: String,
     cgroup_id: u64,
 }
@@ -38,29 +35,27 @@ struct PidCpuMetrics {
 #[derive(Clone)]
 struct CpuProcessEntry {
     comm: String,
-    user_cycles_hist: Hist,
-    kernel_cycles_hist: Hist,
     total_user_cycles: u64,
     total_kernel_cycles: u64,
     total_user_instructions: u64,
     total_kernel_instructions: u64,
-    sample_count: u64,
     pids: Vec<u32>,
 }
 
 // Performance groups based on cycles per second
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum PerfGroup {
-    VeryLow,  // < 10M cycles/sec
-    Low,      // 10-100M cycles/sec
-    Medium,   // 100-1000M cycles/sec
+    VeryLow,  // < 1M cycles/sec
+    Low,      // 1-100M cycles/sec
+    Medium,   // 100M-1G cycles/sec
     High,     // 1-10G cycles/sec
     VeryHigh, // > 10G cycles/sec
 }
 
 impl PerfGroup {
-    fn from_mcycles_per_sec(mcycles: f64) -> Self {
-        if mcycles < 10.0 {
+    fn from_cycles_per_sec(cycles_per_sec: f64) -> Self {
+        let mcycles = cycles_per_sec / 1_000_000.0;
+        if mcycles < 1.0 {
             PerfGroup::VeryLow
         } else if mcycles < 100.0 {
             PerfGroup::Low
@@ -75,11 +70,11 @@ impl PerfGroup {
 
     fn description(&self) -> &'static str {
         match self {
-            PerfGroup::VeryLow => "Very Low (<10M cycles p99)",
-            PerfGroup::Low => "Low (10-100M cycles p99)",
-            PerfGroup::Medium => "Medium (100M-1G cycles p99)",
-            PerfGroup::High => "High (1-10G cycles p99)",
-            PerfGroup::VeryHigh => "Very High (>10G cycles p99)",
+            PerfGroup::VeryLow => "Very Low (<1M cycles/sec)",
+            PerfGroup::Low => "Low (1-100M cycles/sec)",
+            PerfGroup::Medium => "Medium (100M-1G cycles/sec)",
+            PerfGroup::High => "High (1-10G cycles/sec)",
+            PerfGroup::VeryHigh => "Very High (>10G cycles/sec)",
         }
     }
 }
@@ -92,57 +87,13 @@ impl CpuMetrics {
         }
     }
 
-    // Calculate percentile from a histogram (reusing logic from rsched_stats)
-    fn calculate_percentile(&self, hist: &Hist, percentile: u8) -> u64 {
-        let total_count = hist.slots.iter().map(|&count| count as u64).sum::<u64>();
-        if total_count == 0 {
-            return 0;
-        }
-
-        let target_count = (total_count * percentile as u64) / 100;
-        let mut cumulative_count = 0u64;
-
-        for (slot, &count) in hist.slots.iter().enumerate() {
-            let prev_cumulative = cumulative_count;
-            cumulative_count += count as u64;
-
-            if cumulative_count >= target_count {
-                // For CPU metrics, we're using pure log2 histograms
-                // Each slot represents values from 2^slot to 2^(slot+1)-1
-                if slot == 0 {
-                    return 1; // Special case for slot 0
-                }
-
-                // Calculate position within this bucket for interpolation
-                let count_in_bucket = count as u64;
-                let position_in_bucket = target_count - prev_cumulative;
-                let fraction = if count_in_bucket > 0 {
-                    position_in_bucket as f64 / count_in_bucket as f64
-                } else {
-                    0.5
-                };
-
-                let lower_bound = 1u64 << slot;
-                let upper_bound = (1u64 << (slot + 1)) - 1;
-                let range = upper_bound - lower_bound + 1;
-                return lower_bound + (fraction * range as f64) as u64;
-            }
-        }
-
-        // If we get here, return max value
-        1u64 << 63
-    }
-
     pub fn update(&mut self, cpu_data: HashMap<u32, (CpuPerfData, String, u64)>) {
         for (pid, (data, comm, cgroup_id)) in cpu_data {
             let metrics = self.pid_metrics.entry(pid).or_insert(PidCpuMetrics {
-                user_cycles_hist: Hist::default(),
-                kernel_cycles_hist: Hist::default(),
                 total_user_cycles: 0,
                 total_kernel_cycles: 0,
                 total_user_instructions: 0,
                 total_kernel_instructions: 0,
-                sample_count: 0,
                 comm: comm.clone(),
                 cgroup_id,
             });
@@ -151,17 +102,11 @@ impl CpuMetrics {
                 metrics.comm = comm;
             }
             metrics.cgroup_id = cgroup_id;
-            // Merge histograms
-            for i in 0..MAX_SLOTS {
-                metrics.user_cycles_hist.slots[i] += data.user_cycles_hist.slots[i];
-                metrics.kernel_cycles_hist.slots[i] += data.kernel_cycles_hist.slots[i];
-            }
 
             metrics.total_user_cycles += data.total_user_cycles;
             metrics.total_kernel_cycles += data.total_kernel_cycles;
             metrics.total_user_instructions += data.total_user_instructions;
             metrics.total_kernel_instructions += data.total_kernel_instructions;
-            metrics.sample_count += data.sample_count;
         }
     }
 
@@ -189,13 +134,13 @@ impl CpuMetrics {
         println!("\n=== CPU Performance Metrics ===");
 
         // Calculate and print global metrics
-        self.print_global_metrics(&process_entries, elapsed_secs);
+        Self::print_global_metrics(&process_entries, elapsed_secs);
 
         // Print process-level metrics
         if detailed {
-            self.print_detailed_metrics(&process_entries, collapsed, elapsed_secs);
+            Self::print_detailed_metrics(&process_entries, collapsed, elapsed_secs);
         } else {
-            self.print_grouped_metrics(&process_entries, collapsed, elapsed_secs);
+            Self::print_grouped_metrics(&process_entries, collapsed, elapsed_secs);
         }
 
         // Clear incremental data for next interval
@@ -218,35 +163,21 @@ impl CpuMetrics {
                     continue;
                 }
 
-                if metrics.sample_count == 0 {
-                    continue;
-                }
-
                 let entry = comm_map
                     .entry(metrics.comm.clone())
                     .or_insert(CpuProcessEntry {
                         comm: metrics.comm.clone(),
-                        user_cycles_hist: Hist::default(),
-                        kernel_cycles_hist: Hist::default(),
                         total_user_cycles: 0,
                         total_kernel_cycles: 0,
                         total_user_instructions: 0,
                         total_kernel_instructions: 0,
-                        sample_count: 0,
                         pids: Vec::new(),
                     });
-
-                // Merge histograms
-                for i in 0..MAX_SLOTS {
-                    entry.user_cycles_hist.slots[i] += metrics.user_cycles_hist.slots[i];
-                    entry.kernel_cycles_hist.slots[i] += metrics.kernel_cycles_hist.slots[i];
-                }
 
                 entry.total_user_cycles += metrics.total_user_cycles;
                 entry.total_kernel_cycles += metrics.total_kernel_cycles;
                 entry.total_user_instructions += metrics.total_user_instructions;
                 entry.total_kernel_instructions += metrics.total_kernel_instructions;
-                entry.sample_count += metrics.sample_count;
                 entry.pids.push(*pid);
             }
 
@@ -257,24 +188,23 @@ impl CpuMetrics {
                 .iter()
                 .filter(|(pid, metrics)| {
                     Self::should_include_process(pid, &metrics.comm, metrics.cgroup_id, filters)
-                        && metrics.sample_count > 0
+                })
+                .filter(|(_, metrics)| {
+                    metrics.total_user_cycles > 0 || metrics.total_kernel_cycles > 0
                 })
                 .map(|(pid, metrics)| CpuProcessEntry {
                     comm: metrics.comm.clone(),
-                    user_cycles_hist: metrics.user_cycles_hist,
-                    kernel_cycles_hist: metrics.kernel_cycles_hist,
                     total_user_cycles: metrics.total_user_cycles,
                     total_kernel_cycles: metrics.total_kernel_cycles,
                     total_user_instructions: metrics.total_user_instructions,
                     total_kernel_instructions: metrics.total_kernel_instructions,
-                    sample_count: metrics.sample_count,
                     pids: vec![*pid],
                 })
                 .collect()
         }
     }
 
-    fn print_global_metrics(&self, entries: &[CpuProcessEntry], elapsed_secs: f64) {
+    fn print_global_metrics(entries: &[CpuProcessEntry], elapsed_secs: f64) {
         let mut global_user_cycles = 0u64;
         let mut global_kernel_cycles = 0u64;
         let mut global_user_instructions = 0u64;
@@ -286,10 +216,6 @@ impl CpuMetrics {
             global_user_instructions += entry.total_user_instructions;
             global_kernel_instructions += entry.total_kernel_instructions;
         }
-
-        let global_user_mcycles_per_sec = (global_user_cycles as f64 / elapsed_secs) / 1_000_000.0;
-        let global_kernel_mcycles_per_sec =
-            (global_kernel_cycles as f64 / elapsed_secs) / 1_000_000.0;
 
         let global_user_ipc = if global_user_cycles > 0 {
             global_user_instructions as f64 / global_user_cycles as f64
@@ -304,27 +230,21 @@ impl CpuMetrics {
         };
 
         println!(
-            "Global: User {:.1}M cycles/sec (IPC: {:.2}), Kernel {:.1}M cycles/sec (IPC: {:.2})",
-            global_user_mcycles_per_sec,
+            "Global: User {} cycles/sec (IPC: {:.2}), Kernel {} cycles/sec (IPC: {:.2})",
+            format_rate(global_user_cycles as f64 / elapsed_secs),
             global_user_ipc,
-            global_kernel_mcycles_per_sec,
+            format_rate(global_kernel_cycles as f64 / elapsed_secs),
             global_kernel_ipc
         );
     }
 
-    fn print_detailed_metrics(
-        &self,
-        entries: &[CpuProcessEntry],
-        collapsed: bool,
-        elapsed_secs: f64,
-    ) {
-        println!("\nDetailed CPU Performance by Process (cycles are per timeslice):");
+    fn print_detailed_metrics(entries: &[CpuProcessEntry], collapsed: bool, elapsed_secs: f64) {
         println!(
-            "(Showing all {} processes with CPU metrics)\n",
+            "\nDetailed CPU Performance by Process ({} processes):\n",
             entries.len()
         );
 
-        // Sort by total cycles
+        // Sort by total cycles/sec
         let mut sorted_entries = entries.to_vec();
         sorted_entries.sort_by(|a, b| {
             let a_total = a.total_user_cycles + a.total_kernel_cycles;
@@ -332,17 +252,11 @@ impl CpuMetrics {
             b_total.cmp(&a_total)
         });
 
-        // In detailed mode, show ALL entries
         let entry_refs: Vec<&CpuProcessEntry> = sorted_entries.iter().collect();
-        self.print_process_table(&entry_refs, collapsed, elapsed_secs);
+        Self::print_process_table(&entry_refs, collapsed, elapsed_secs);
     }
 
-    fn print_process_table(
-        &self,
-        entries: &[&CpuProcessEntry],
-        collapsed: bool,
-        _elapsed_secs: f64,
-    ) {
+    fn print_process_table(entries: &[&CpuProcessEntry], collapsed: bool, elapsed_secs: f64) {
         // Calculate max command length
         let max_comm_len = entries
             .iter()
@@ -353,11 +267,11 @@ impl CpuMetrics {
 
         if collapsed {
             println!(
-                "  {:<width$} {:<8} {:<20} {:<20} {:<8} {:<8} {:<15}",
+                "  {:<width$} {:<8} {:<14} {:<14} {:<8} {:<8} {:<15}",
                 "COMMAND",
                 "PROCS",
-                "USER CYC(p50/p99)",
-                "KERN CYC(p50/p99)",
+                "USER CYC/s",
+                "KERN CYC/s",
                 "U-IPC",
                 "K-IPC",
                 "PIDs",
@@ -365,11 +279,11 @@ impl CpuMetrics {
             );
         } else {
             println!(
-                "  {:<8} {:<width$} {:<20} {:<20} {:<8} {:<8}",
+                "  {:<8} {:<width$} {:<14} {:<14} {:<8} {:<8}",
                 "PID",
                 "COMMAND",
-                "USER CYC(p50/p99)",
-                "KERN CYC(p50/p99)",
+                "USER CYC/s",
+                "KERN CYC/s",
                 "U-IPC",
                 "K-IPC",
                 width = max_comm_len
@@ -377,34 +291,9 @@ impl CpuMetrics {
         }
 
         for entry in entries {
-            // Calculate percentiles for cycles
-            let user_p50 = self.calculate_percentile(&entry.user_cycles_hist, 50);
-            let user_p99 = self.calculate_percentile(&entry.user_cycles_hist, 99);
-            let kernel_p50 = self.calculate_percentile(&entry.kernel_cycles_hist, 50);
-            let kernel_p99 = self.calculate_percentile(&entry.kernel_cycles_hist, 99);
+            let user_cycles_per_sec = entry.total_user_cycles as f64 / elapsed_secs;
+            let kernel_cycles_per_sec = entry.total_kernel_cycles as f64 / elapsed_secs;
 
-            // Format as K/M/G for readability
-            let format_cycles = |cycles: u64| -> String {
-                if cycles >= 1_000_000_000 {
-                    format!("{:.1}G", cycles as f64 / 1_000_000_000.0)
-                } else if cycles >= 1_000_000 {
-                    format!("{:.1}M", cycles as f64 / 1_000_000.0)
-                } else if cycles >= 1_000 {
-                    format!("{:.1}K", cycles as f64 / 1_000.0)
-                } else {
-                    format!("{}", cycles)
-                }
-            };
-
-            let user_cycles_str =
-                format!("{}/{}", format_cycles(user_p50), format_cycles(user_p99));
-            let kernel_cycles_str = format!(
-                "{}/{}",
-                format_cycles(kernel_p50),
-                format_cycles(kernel_p99)
-            );
-
-            // IPC calculations remain the same (ratio doesn't change with averaging)
             let user_ipc = if entry.total_user_cycles > 0 {
                 entry.total_user_instructions as f64 / entry.total_user_cycles as f64
             } else {
@@ -418,13 +307,13 @@ impl CpuMetrics {
             };
 
             if collapsed {
-                let pid_str = self.format_pid_list(&entry.pids);
+                let pid_str = Self::format_pid_list(&entry.pids);
                 println!(
-                    "  {:<width$} {:<8} {:<20} {:<20} {:<8.2} {:<8.2} {:<15}",
+                    "  {:<width$} {:<8} {:<14} {:<14} {:<8.2} {:<8.2} {:<15}",
                     &entry.comm,
                     entry.pids.len(),
-                    user_cycles_str,
-                    kernel_cycles_str,
+                    format_rate(user_cycles_per_sec),
+                    format_rate(kernel_cycles_per_sec),
                     user_ipc,
                     kernel_ipc,
                     pid_str,
@@ -432,11 +321,11 @@ impl CpuMetrics {
                 );
             } else {
                 println!(
-                    "  {:<8} {:<width$} {:<20} {:<20} {:<8.2} {:<8.2}",
+                    "  {:<8} {:<width$} {:<14} {:<14} {:<8.2} {:<8.2}",
                     entry.pids[0],
                     &entry.comm,
-                    user_cycles_str,
-                    kernel_cycles_str,
+                    format_rate(user_cycles_per_sec),
+                    format_rate(kernel_cycles_per_sec),
                     user_ipc,
                     kernel_ipc,
                     width = max_comm_len
@@ -445,23 +334,15 @@ impl CpuMetrics {
         }
     }
 
-    fn print_grouped_metrics(
-        &self,
-        entries: &[CpuProcessEntry],
-        collapsed: bool,
-        elapsed_secs: f64,
-    ) {
-        println!("\nCPU Performance by Usage Group (cycles are per timeslice):\n");
+    fn print_grouped_metrics(entries: &[CpuProcessEntry], collapsed: bool, elapsed_secs: f64) {
+        println!("\nCPU Performance by Usage Group:\n");
 
         let mut perf_groups: HashMap<PerfGroup, Vec<&CpuProcessEntry>> = HashMap::new();
 
         for entry in entries {
-            // Use p99 of total cycles (user + kernel) for grouping
-            let user_p99 = self.calculate_percentile(&entry.user_cycles_hist, 99);
-            let kernel_p99 = self.calculate_percentile(&entry.kernel_cycles_hist, 99);
-            let total_p99_mcycles = (user_p99 + kernel_p99) as f64 / 1_000_000.0;
-
-            let group = PerfGroup::from_mcycles_per_sec(total_p99_mcycles);
+            let total_cycles_per_sec =
+                (entry.total_user_cycles + entry.total_kernel_cycles) as f64 / elapsed_secs;
+            let group = PerfGroup::from_cycles_per_sec(total_cycles_per_sec);
             perf_groups.entry(group).or_default().push(entry);
         }
 
@@ -471,17 +352,11 @@ impl CpuMetrics {
         for (group, group_entries) in groups.iter().rev() {
             println!("{} ({} entries):", group.description(), group_entries.len());
 
-            // Sort within group by p99 total cycles
-            let mut sorted_entries: Vec<&CpuProcessEntry> = group_entries.to_vec().clone();
+            // Sort within group by total cycles/sec
+            let mut sorted_entries: Vec<&CpuProcessEntry> = group_entries.to_vec();
             sorted_entries.sort_by(|a, b| {
-                let a_user_p99 = self.calculate_percentile(&a.user_cycles_hist, 99);
-                let a_kernel_p99 = self.calculate_percentile(&a.kernel_cycles_hist, 99);
-                let b_user_p99 = self.calculate_percentile(&b.user_cycles_hist, 99);
-                let b_kernel_p99 = self.calculate_percentile(&b.kernel_cycles_hist, 99);
-
-                let a_total = a_user_p99 + a_kernel_p99;
-                let b_total = b_user_p99 + b_kernel_p99;
-
+                let a_total = a.total_user_cycles + a.total_kernel_cycles;
+                let b_total = b.total_user_cycles + b.total_kernel_cycles;
                 b_total.cmp(&a_total)
             });
 
@@ -490,7 +365,7 @@ impl CpuMetrics {
             let table_entries: Vec<&CpuProcessEntry> =
                 sorted_entries.iter().take(show_count).copied().collect();
 
-            self.print_process_table(&table_entries, collapsed, elapsed_secs);
+            Self::print_process_table(&table_entries, collapsed, elapsed_secs);
 
             if sorted_entries.len() > show_count {
                 println!("  ... and {} more\n", sorted_entries.len() - show_count);
@@ -537,7 +412,7 @@ impl CpuMetrics {
         true
     }
 
-    fn format_pid_list(&self, pids: &[u32]) -> String {
+    fn format_pid_list(pids: &[u32]) -> String {
         let mut sorted_pids = pids.to_vec();
         sorted_pids.sort();
 
@@ -559,5 +434,19 @@ impl CpuMetrics {
                 sorted_pids.len() - 3
             )
         }
+    }
+}
+
+fn format_rate(value: f64) -> String {
+    if value >= 1_000_000_000_000.0 {
+        format!("{:.1}T", value / 1_000_000_000_000.0)
+    } else if value >= 1_000_000_000.0 {
+        format!("{:.1}G", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else {
+        format!("{:.0}", value)
     }
 }
