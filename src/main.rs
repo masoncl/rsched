@@ -565,13 +565,7 @@ fn main() -> Result<()> {
             stats.print_summary(output_mode, &filter_options)?;
 
             if let Some(ref mut metrics) = cpu_metrics {
-                let cpu_filters = cpu_metrics::CpuFilterOptions {
-                    comm_regexes: filter_options.comm_regexes.clone(),
-                    pid_filter: filter_options.pid_filter,
-                    detailed: args.detailed,
-                    collapsed: !args.no_collapse,
-                };
-                metrics.print_summary(&cpu_filters);
+                metrics.print_summary(output_mode, &filter_options);
             }
         }
     }

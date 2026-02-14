@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 use crate::rsched_collector::{Hist, MAX_SLOTS};
-use regex::Regex;
+use crate::rsched_stats::{FilterOptions, OutputMode};
 use std::collections::HashMap;
 
 #[repr(C)]
@@ -31,6 +31,7 @@ struct PidCpuMetrics {
     total_kernel_instructions: u64,
     sample_count: u64,
     comm: String,
+    cgroup_id: u64,
 }
 
 // Represents either a single process or a collapsed group of processes
@@ -83,13 +84,6 @@ impl PerfGroup {
     }
 }
 
-pub struct CpuFilterOptions {
-    pub comm_regexes: Option<Vec<Regex>>,
-    pub pid_filter: Option<u32>,
-    pub detailed: bool,
-    pub collapsed: bool,
-}
-
 impl CpuMetrics {
     pub fn new() -> Self {
         Self {
@@ -140,7 +134,7 @@ impl CpuMetrics {
     }
 
     pub fn update(&mut self, cpu_data: HashMap<u32, (CpuPerfData, String, u64)>) {
-        for (pid, (data, comm, _cgroup_id)) in cpu_data {
+        for (pid, (data, comm, cgroup_id)) in cpu_data {
             let metrics = self.pid_metrics.entry(pid).or_insert(PidCpuMetrics {
                 user_cycles_hist: Hist::default(),
                 kernel_cycles_hist: Hist::default(),
@@ -150,11 +144,13 @@ impl CpuMetrics {
                 total_kernel_instructions: 0,
                 sample_count: 0,
                 comm: comm.clone(),
+                cgroup_id,
             });
 
             if metrics.comm != comm {
                 metrics.comm = comm;
             }
+            metrics.cgroup_id = cgroup_id;
             // Merge histograms
             for i in 0..MAX_SLOTS {
                 metrics.user_cycles_hist.slots[i] += data.user_cycles_hist.slots[i];
@@ -169,7 +165,7 @@ impl CpuMetrics {
         }
     }
 
-    pub fn print_summary(&mut self, filters: &CpuFilterOptions) {
+    pub fn print_summary(&mut self, output_mode: OutputMode, filters: &FilterOptions) {
         let now = std::time::Instant::now();
         let elapsed_secs = now.duration_since(self.last_update_time).as_secs_f64();
         self.last_update_time = now;
@@ -178,8 +174,11 @@ impl CpuMetrics {
             return;
         }
 
+        let collapsed = matches!(output_mode, OutputMode::Collapsed);
+        let detailed = matches!(output_mode, OutputMode::Detailed);
+
         // Build process entries based on collapse mode
-        let process_entries = self.build_process_entries(filters, elapsed_secs);
+        let process_entries = self.build_process_entries(filters, collapsed, detailed);
 
         if process_entries.is_empty() {
             println!("\n=== CPU Performance Metrics ===");
@@ -193,10 +192,10 @@ impl CpuMetrics {
         self.print_global_metrics(&process_entries, elapsed_secs);
 
         // Print process-level metrics
-        if filters.detailed {
-            self.print_detailed_metrics(&process_entries, filters.collapsed, elapsed_secs);
+        if detailed {
+            self.print_detailed_metrics(&process_entries, collapsed, elapsed_secs);
         } else {
-            self.print_grouped_metrics(&process_entries, filters.collapsed, elapsed_secs);
+            self.print_grouped_metrics(&process_entries, collapsed, elapsed_secs);
         }
 
         // Clear incremental data for next interval
@@ -205,16 +204,17 @@ impl CpuMetrics {
 
     fn build_process_entries(
         &self,
-        filters: &CpuFilterOptions,
-        _elapsed_secs: f64,
+        filters: &FilterOptions,
+        collapsed: bool,
+        detailed: bool,
     ) -> Vec<CpuProcessEntry> {
         // In detailed mode, always show individual processes (implies -C/no-collapse)
-        if filters.collapsed && !filters.detailed {
+        if collapsed && !detailed {
             // Collapse by command name
             let mut comm_map: HashMap<String, CpuProcessEntry> = HashMap::new();
 
             for (pid, metrics) in &self.pid_metrics {
-                if !self.should_include_process(pid, &metrics.comm, filters) {
+                if !Self::should_include_process(pid, &metrics.comm, metrics.cgroup_id, filters) {
                     continue;
                 }
 
@@ -256,7 +256,7 @@ impl CpuMetrics {
             self.pid_metrics
                 .iter()
                 .filter(|(pid, metrics)| {
-                    self.should_include_process(pid, &metrics.comm, filters)
+                    Self::should_include_process(pid, &metrics.comm, metrics.cgroup_id, filters)
                         && metrics.sample_count > 0
                 })
                 .map(|(pid, metrics)| CpuProcessEntry {
@@ -500,18 +500,37 @@ impl CpuMetrics {
         }
     }
 
-    fn should_include_process(&self, pid: &u32, comm: &str, filters: &CpuFilterOptions) -> bool {
-        // Check PID filter
+    fn should_include_process(
+        pid: &u32,
+        comm: &str,
+        cgroup_id: u64,
+        filters: &FilterOptions,
+    ) -> bool {
         if let Some(filter_pid) = filters.pid_filter {
             if *pid != filter_pid {
                 return false;
             }
         }
 
-        // Check comm regex filter
-        if let Some(ref regexes) = filters.comm_regexes {
-            if !regexes.iter().any(|regex| regex.is_match(comm)) {
-                return false;
+        // Check if this process matches a global comm pattern (bypasses cgroup filter)
+        let global_comm_match = if let Some(ref regexes) = filters.global_comm_regexes {
+            regexes.iter().any(|regex| regex.is_match(comm))
+        } else {
+            false
+        };
+
+        if !global_comm_match {
+            // Normal filtering: comm AND cgroup
+            if let Some(ref regexes) = filters.comm_regexes {
+                if !regexes.iter().any(|regex| regex.is_match(comm)) {
+                    return false;
+                }
+            }
+
+            if let Some(ref cgroup_set) = filters.cgroup_filter {
+                if !cgroup_set.contains(&cgroup_id) {
+                    return false;
+                }
             }
         }
 
