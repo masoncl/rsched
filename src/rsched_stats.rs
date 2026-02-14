@@ -1,6 +1,6 @@
 // src/rsched_stats.rs
 // SPDX-License-Identifier: GPL-2.0
-use crate::rsched_collector::{Hist, MigrationCounts, TimesliceStats, MAX_SLOTS};
+use crate::rsched_collector::{Hist, MigHist, MigrationCounts, TimesliceStats, MIG_HIST_SLOTS};
 use crate::schedstat::SchedstatData;
 use anyhow::Result;
 use regex::Regex;
@@ -60,6 +60,7 @@ impl<T: Clone + Default> Default for StatsData<T> {
 
 // Type aliases for clarity
 type HistogramStats = StatsData<Hist>;
+type MigHistStats = StatsData<MigHist>;
 type TimesliceStatsData = StatsData<TimesliceStats>;
 
 pub struct RschedStats {
@@ -71,9 +72,9 @@ pub struct RschedStats {
     nr_running_stats: HashMap<u32, HistogramStats>,
     waking_delay_stats: HashMap<u32, HistogramStats>,
     sleep_duration_stats: HashMap<u32, HistogramStats>,
-    migration_stats: HashMap<u32, HistogramStats>,
-    migration_ccx_stats: HashMap<u32, HistogramStats>,
-    migration_numa_stats: HashMap<u32, HistogramStats>,
+    migration_stats: HashMap<u32, MigHistStats>,
+    migration_ccx_stats: HashMap<u32, MigHistStats>,
+    migration_numa_stats: HashMap<u32, MigHistStats>,
     schedstat_data: Option<SchedstatData>,
     pub num_dies: usize,
     pub num_numa_nodes: usize,
@@ -87,9 +88,9 @@ struct ProcessEntry {
     nr_running_hist: Hist,
     waking_delay_hist: Hist,
     sleep_duration_hist: Hist,
-    migration_hist: Hist,
-    migration_ccx_hist: Hist,
-    migration_numa_hist: Hist,
+    migration_hist: MigHist,
+    migration_ccx_hist: MigHist,
+    migration_numa_hist: MigHist,
     pids: Vec<u32>,
 }
 
@@ -175,7 +176,24 @@ impl TableColumn {
     }
 }
 
-// Histogram operations trait
+// Trait for accessing linear-indexed histogram slots (nr_running, migration, etc.)
+trait LinearHist {
+    fn slots(&self) -> &[u32];
+}
+
+impl LinearHist for Hist {
+    fn slots(&self) -> &[u32] {
+        &self.slots
+    }
+}
+
+impl LinearHist for MigHist {
+    fn slots(&self) -> &[u32] {
+        &self.slots
+    }
+}
+
+// Histogram operations trait (merge + total_count)
 trait HistogramOps {
     fn merge_into(&mut self, other: &Self);
     fn total_count(&self) -> u64;
@@ -183,13 +201,25 @@ trait HistogramOps {
 
 impl HistogramOps for Hist {
     fn merge_into(&mut self, other: &Self) {
-        for i in 0..MAX_SLOTS {
-            self.slots[i] += other.slots[i];
+        for (s, o) in self.slots.iter_mut().zip(other.slots.iter()) {
+            *s += *o;
         }
     }
 
     fn total_count(&self) -> u64 {
-        self.slots.iter().map(|&count| count as u64).sum()
+        self.slots.iter().map(|&c| c as u64).sum()
+    }
+}
+
+impl HistogramOps for MigHist {
+    fn merge_into(&mut self, other: &Self) {
+        for (s, o) in self.slots.iter_mut().zip(other.slots.iter()) {
+            *s += *o;
+        }
+    }
+
+    fn total_count(&self) -> u64 {
+        self.slots.iter().map(|&c| c as u64).sum()
     }
 }
 
@@ -287,11 +317,11 @@ impl RschedStats {
 
     /// Update migration stats from raw counts collected over a 1-second period.
     /// Each PID's count becomes one sample in a linear histogram (slot = count,
-    /// capped at MAX_SLOTS-1), giving us a distribution of migrations-per-second.
+    /// capped at MIG_HIST_SLOTS-1), giving us a distribution of migrations-per-second.
     pub fn update_migrations(&mut self, counts: HashMap<u32, (MigrationCounts, String, u64)>) {
         for (pid, (mig, comm, cgroup_id)) in counts {
             // Helper to record a count into a histogram stats entry
-            let record = |stats_map: &mut HashMap<u32, HistogramStats>, count: u64| {
+            let record = |stats_map: &mut HashMap<u32, MigHistStats>, count: u64| {
                 let stats = stats_map.entry(pid).or_default();
                 if stats.comm != comm {
                     stats.comm = comm.clone();
@@ -299,10 +329,10 @@ impl RschedStats {
                 if stats.cgroup_id != cgroup_id {
                     stats.cgroup_id = cgroup_id;
                 }
-                let slot = if (count as usize) < MAX_SLOTS {
+                let slot = if (count as usize) < MIG_HIST_SLOTS {
                     count as usize
                 } else {
-                    MAX_SLOTS - 1
+                    MIG_HIST_SLOTS - 1
                 };
                 stats.data.slots[slot] += 1;
             };
@@ -385,7 +415,7 @@ impl RschedStats {
             self.print_migration_stats(&process_entries, detailed, collapsed)?;
 
             if self.num_dies > 1 {
-                self.print_migration_type_stats(
+                self.print_migration_type_stats::<MigHist, _>(
                     &process_entries,
                     detailed,
                     collapsed,
@@ -397,7 +427,7 @@ impl RschedStats {
             }
 
             if self.num_numa_nodes > 1 {
-                self.print_migration_type_stats(
+                self.print_migration_type_stats::<MigHist, _>(
                     &process_entries,
                     detailed,
                     collapsed,
@@ -751,8 +781,8 @@ impl RschedStats {
 
             let mut sorted_entries = entries_with_data;
             sorted_entries.sort_by(|a, b| {
-                let a_p90 = self.calculate_nr_running_percentile(&a.nr_running_hist, 90);
-                let b_p90 = self.calculate_nr_running_percentile(&b.nr_running_hist, 90);
+                let a_p90 = Self::calculate_linear_percentile(&a.nr_running_hist, 90);
+                let b_p90 = Self::calculate_linear_percentile(&b.nr_running_hist, 90);
                 b_p90.cmp(&a_p90)
             });
 
@@ -771,7 +801,7 @@ impl RschedStats {
     }
 
     fn print_nr_running_table(&self, entries: &[&ProcessEntry], collapsed: bool) {
-        self.print_nr_running_table_with_hist(entries, collapsed, |e| &e.nr_running_hist);
+        self.print_linear_hist_table(entries, collapsed, |e| &e.nr_running_hist);
     }
 
     fn print_migration_stats(
@@ -790,7 +820,7 @@ impl RschedStats {
 
         let entries_with_data: Vec<&ProcessEntry> = entries
             .iter()
-            .filter(|e| e.migration_hist.total_count() > 0)
+            .filter(|e| HistogramOps::total_count(&e.migration_hist) > 0)
             .collect();
 
         if entries_with_data.is_empty() {
@@ -799,16 +829,14 @@ impl RschedStats {
         }
 
         if detailed {
-            self.print_nr_running_table_with_hist(&entries_with_data, collapsed, |e| {
-                &e.migration_hist
-            });
+            self.print_linear_hist_table(&entries_with_data, collapsed, |e| &e.migration_hist);
         } else {
             println!("Processes by migration rate:\n");
 
             let mut sorted_entries = entries_with_data;
             sorted_entries.sort_by(|a, b| {
-                let a_p90 = self.calculate_nr_running_percentile(&a.migration_hist, 90);
-                let b_p90 = self.calculate_nr_running_percentile(&b.migration_hist, 90);
+                let a_p90 = Self::calculate_linear_percentile(&a.migration_hist, 90);
+                let b_p90 = Self::calculate_linear_percentile(&b.migration_hist, 90);
                 b_p90.cmp(&a_p90)
             });
 
@@ -816,7 +844,7 @@ impl RschedStats {
             let table_entries: Vec<&ProcessEntry> =
                 sorted_entries.iter().take(show_count).copied().collect();
 
-            self.print_nr_running_table_with_hist(&table_entries, collapsed, |e| &e.migration_hist);
+            self.print_linear_hist_table(&table_entries, collapsed, |e| &e.migration_hist);
 
             if sorted_entries.len() > show_count {
                 println!("  ... and {} more\n", sorted_entries.len() - show_count);
@@ -827,7 +855,7 @@ impl RschedStats {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn print_migration_type_stats<F>(
+    fn print_migration_type_stats<H, F>(
         &self,
         entries: &[ProcessEntry],
         detailed: bool,
@@ -838,7 +866,8 @@ impl RschedStats {
         hist_getter: F,
     ) -> Result<()>
     where
-        F: Fn(&ProcessEntry) -> &Hist + Copy,
+        H: LinearHist + HistogramOps,
+        F: Fn(&ProcessEntry) -> &H + Copy,
     {
         let title = if collapsed {
             format!("Collapsed {}", title_base)
@@ -859,14 +888,14 @@ impl RschedStats {
         }
 
         if detailed {
-            self.print_nr_running_table_with_hist(&entries_with_data, collapsed, hist_getter);
+            self.print_linear_hist_table(&entries_with_data, collapsed, hist_getter);
         } else {
             println!("Processes by {}:\n", sort_label);
 
             let mut sorted_entries = entries_with_data;
             sorted_entries.sort_by(|a, b| {
-                let a_p90 = self.calculate_nr_running_percentile(hist_getter(a), 90);
-                let b_p90 = self.calculate_nr_running_percentile(hist_getter(b), 90);
+                let a_p90 = Self::calculate_linear_percentile(hist_getter(a), 90);
+                let b_p90 = Self::calculate_linear_percentile(hist_getter(b), 90);
                 b_p90.cmp(&a_p90)
             });
 
@@ -874,7 +903,7 @@ impl RschedStats {
             let table_entries: Vec<&ProcessEntry> =
                 sorted_entries.iter().take(show_count).copied().collect();
 
-            self.print_nr_running_table_with_hist(&table_entries, collapsed, hist_getter);
+            self.print_linear_hist_table(&table_entries, collapsed, hist_getter);
 
             if sorted_entries.len() > show_count {
                 println!("  ... and {} more\n", sorted_entries.len() - show_count);
@@ -885,13 +914,14 @@ impl RschedStats {
     }
 
     /// Generic table printer for linear-indexed histograms (nr_running, migration, etc.)
-    fn print_nr_running_table_with_hist<F>(
+    fn print_linear_hist_table<H, F>(
         &self,
         entries: &[&ProcessEntry],
         collapsed: bool,
         hist_getter: F,
     ) where
-        F: Fn(&ProcessEntry) -> &Hist,
+        H: LinearHist + HistogramOps,
+        F: Fn(&ProcessEntry) -> &H,
     {
         let max_comm_len = entries
             .iter()
@@ -931,9 +961,9 @@ impl RschedStats {
                 continue;
             }
 
-            let p50 = self.calculate_nr_running_percentile(hist, 50);
-            let p90 = self.calculate_nr_running_percentile(hist, 90);
-            let p99 = self.calculate_nr_running_percentile(hist, 99);
+            let p50 = Self::calculate_linear_percentile(hist, 50);
+            let p90 = Self::calculate_linear_percentile(hist, 90);
+            let p99 = Self::calculate_linear_percentile(hist, 99);
 
             if collapsed {
                 println!(
@@ -1124,9 +1154,9 @@ impl RschedStats {
             nr_running_hist: Hist::default(),
             waking_delay_hist: Hist::default(),
             sleep_duration_hist: Hist::default(),
-            migration_hist: Hist::default(),
-            migration_ccx_hist: Hist::default(),
-            migration_numa_hist: Hist::default(),
+            migration_hist: MigHist::default(),
+            migration_ccx_hist: MigHist::default(),
+            migration_numa_hist: MigHist::default(),
             pids,
         }
     }
@@ -1377,7 +1407,7 @@ impl RschedStats {
                 .or_insert_with(|| {
                     Self::create_default_process_entry(mig_data.comm.clone(), vec![*pid])
                 })
-                .migration_hist = mig_data.data;
+                .migration_hist = mig_data.data.clone();
         }
 
         // Process migration CCX stats
@@ -1393,7 +1423,7 @@ impl RschedStats {
                 .or_insert_with(|| {
                     Self::create_default_process_entry(mig_data.comm.clone(), vec![*pid])
                 })
-                .migration_ccx_hist = mig_data.data;
+                .migration_ccx_hist = mig_data.data.clone();
         }
 
         // Process migration NUMA stats
@@ -1409,7 +1439,7 @@ impl RschedStats {
                 .or_insert_with(|| {
                     Self::create_default_process_entry(mig_data.comm.clone(), vec![*pid])
                 })
-                .migration_numa_hist = mig_data.data;
+                .migration_numa_hist = mig_data.data.clone();
         }
 
         pid_entries.into_values().collect()
@@ -1495,7 +1525,7 @@ impl RschedStats {
         1u64 << 27
     }
 
-    fn calculate_nr_running_percentile(&self, hist: &Hist, percentile: u8) -> u32 {
+    fn calculate_linear_percentile<H: LinearHist + HistogramOps>(hist: &H, percentile: u8) -> u32 {
         let total_count = hist.total_count();
         if total_count == 0 {
             return 0;
@@ -1503,15 +1533,16 @@ impl RschedStats {
 
         let target_count = (total_count * percentile as u64) / 100;
         let mut cumulative_count = 0u64;
+        let slots = hist.slots();
 
-        for (slot, &count) in hist.slots.iter().enumerate() {
+        for (slot, &count) in slots.iter().enumerate() {
             cumulative_count += count as u64;
             if cumulative_count >= target_count {
                 return slot as u32;
             }
         }
 
-        63
+        (slots.len() - 1) as u32
     }
 
     fn get_slot_range(&self, slot: usize) -> (u64, u64) {

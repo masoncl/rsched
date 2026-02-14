@@ -6,6 +6,7 @@ use plain::Plain;
 use std::collections::HashMap;
 
 pub const MAX_SLOTS: usize = 64;
+pub const MIG_HIST_SLOTS: usize = 1025;
 pub const TASK_COMM_LEN: usize = 16;
 
 #[repr(C)]
@@ -18,6 +19,19 @@ impl Default for Hist {
     fn default() -> Self {
         Self {
             slots: [0; MAX_SLOTS],
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MigHist {
+    pub slots: [u32; MIG_HIST_SLOTS],
+}
+
+impl Default for MigHist {
+    fn default() -> Self {
+        Self {
+            slots: [0; MIG_HIST_SLOTS],
         }
     }
 }
