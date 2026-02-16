@@ -1095,18 +1095,26 @@ static __always_inline int handle_migrate(struct task_struct *p, int dest_cpu)
 
 	__sync_fetch_and_add(&data->count, 1);
 
-	int orig_cpu = bpf_task_cpu(p);
-	if (orig_cpu < 0 || orig_cpu >= MAX_CPUS ||
-	    dest_cpu < 0 || dest_cpu >= MAX_CPUS)
+	/*
+	 * Use __u32 and separate comparisons so each register gets a
+	 * direct bounds check the verifier can track. The compiler folds
+	 * signed range checks (< 0 || >= MAX_CPUS) into a single AND on
+	 * a copy register, which leaves the original register unbounded.
+	 */
+	__u32 orig_cpu = bpf_task_cpu(p);
+	__u32 dcpu = dest_cpu;
+	if (orig_cpu >= MAX_CPUS)
+		return 0;
+	if (dcpu >= MAX_CPUS)
 		return 0;
 
 	__s32 orig_numa = cpu_to_numa[orig_cpu];
-	__s32 dest_numa = cpu_to_numa[dest_cpu];
+	__s32 dest_numa = cpu_to_numa[dcpu];
 	if (orig_numa >= 0 && dest_numa >= 0 && orig_numa != dest_numa) {
 		__sync_fetch_and_add(&data->cross_numa_count, 1);
 	} else {
 		__s32 orig_die = cpu_to_die[orig_cpu];
-		__s32 dest_die = cpu_to_die[dest_cpu];
+		__s32 dest_die = cpu_to_die[dcpu];
 		if (orig_die >= 0 && dest_die >= 0 && orig_die != dest_die)
 			__sync_fetch_and_add(&data->cross_ccx_count, 1);
 	}
