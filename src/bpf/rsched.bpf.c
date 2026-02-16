@@ -484,35 +484,37 @@ static __always_inline __u32 log2_slot(__u64 v)
  * - 10μs resolution for delays 0-499μs (covers most scheduling delays)
  * - Log2 scaling for larger delays up to ~134 seconds
  */
-static __always_inline __u32 hist_slot(__u64 delay_ns)
+/*
+ * __noinline forces a BPF subprogram call boundary so the compiler cannot
+ * prove the return value range and eliminate the callers' if (slot < MAX_SLOTS)
+ * bounds checks. Without this, __always_inline lets the compiler see that
+ * slot < MAX_SLOTS always holds, it removes every bounds check, and the BPF
+ * verifier (which cannot track ranges through division) rejects the program.
+ *
+ * Returns __u64 so the call site comparison operates directly on the 64-bit
+ * return register (r0) without a 32-bit truncation (<<32; >>32) that would
+ * break the verifier's register ID linkage between the bounds check and the
+ * subsequent array access.
+ */
+static __noinline __u64 hist_slot(__u64 delay_ns)
 {
 	__u64 delay_us = delay_ns / 1000;
+	__u64 slot;
 
 	if (delay_us < LINEAR_THRESHOLD) {
-		// Linear buckets: slot = delay_us / LINEAR_STEP
-		__u32 slot = delay_us / LINEAR_STEP;
-		return slot < LINEAR_SLOTS ? slot : LINEAR_SLOTS - 1;
+		slot = delay_us / LINEAR_STEP;
+		if (slot >= LINEAR_SLOTS)
+			slot = LINEAR_SLOTS - 1;
+	} else if (delay_us < 512) {
+		slot = LINEAR_SLOTS;
 	} else {
-		// Log2 buckets for values >= 500μs
-		// Find position of highest bit
-		__u32 log2_val = log2_u64(delay_us);
-
-		// log2(500) ≈ 8.97, but we'll map based on powers of 2
-		// Starting from 512μs (2^9) for cleaner boundaries
-		// This maps:
-		// 500-511μs → slot 50
-		// 512-1023μs → slot 50 (2^9 to 2^10-1)
-		// 1024-2047μs → slot 51 (2^10 to 2^11-1)
-		// etc.
-		if (delay_us < 512) {
-			return LINEAR_SLOTS; // slot 50 for 500-511μs
-		}
-
-		__u32 slot = LINEAR_SLOTS + (log2_val - 8);
-
-		// Cap at MAX_SLOTS - 1
-		return slot < MAX_SLOTS ? slot : MAX_SLOTS - 1;
+		__u64 log2_val = log2_u64(delay_us);
+		slot = LINEAR_SLOTS + (log2_val - 8);
+		if (slot >= MAX_SLOTS)
+			slot = MAX_SLOTS - 1;
 	}
+
+	return slot;
 }
 
 // sched_wakeup and sched_wakeup_new
@@ -575,7 +577,7 @@ check_sleep:
 				}
 
 				if (sleep_data) {
-					__u32 slot = hist_slot(sleep_duration);
+					__u64 slot = hist_slot(sleep_duration);
 					if (slot < MAX_SLOTS) {
 						__sync_fetch_and_add(
 							&sleep_data->hist
@@ -867,7 +869,7 @@ static __always_inline void update_timeslices(__u32 next_pid, __u32 prev_pid,
 	}
 
 	if (timeslice < 10000000000ULL) { // Skip > 10 seconds
-		__u32 slot = hist_slot(timeslice);
+		__u64 slot = hist_slot(timeslice);
 		if (slot < MAX_SLOTS) {
 			if (involuntary) {
 				// Involuntary context switch
@@ -893,7 +895,7 @@ update_queue_delay(__u32 next_pid, struct task_struct *next, __u64 now)
 {
 	__u64 *start_ts;
 	__u64 delay;
-	__u32 slot;
+	__u64 slot;
 	__u32 cpu;
 	struct hist_data *data;
 
@@ -945,7 +947,7 @@ update_waking_delay(__u32 next_pid, struct task_struct *next, __u64 now)
 {
 	__u64 *start_ts;
 	__u64 delay;
-	__u32 slot;
+	__u64 slot;
 
 	if (!trace_sched_waking)
 		return;
@@ -1002,7 +1004,7 @@ static __always_inline void update_cpu_idle(__u32 cpu, __u64 now)
 			}
 
 			if (cpu_idle_hist) {
-				__u32 slot = hist_slot(idle_duration);
+				__u64 slot = hist_slot(idle_duration);
 				if (slot < MAX_SLOTS) {
 					__sync_fetch_and_add(
 						&cpu_idle_hist->slots[slot], 1);
@@ -1093,18 +1095,26 @@ static __always_inline int handle_migrate(struct task_struct *p, int dest_cpu)
 
 	__sync_fetch_and_add(&data->count, 1);
 
-	int orig_cpu = bpf_task_cpu(p);
-	if (orig_cpu < 0 || orig_cpu >= MAX_CPUS ||
-	    dest_cpu < 0 || dest_cpu >= MAX_CPUS)
+	/*
+	 * Use __u32 and separate comparisons so each register gets a
+	 * direct bounds check the verifier can track. The compiler folds
+	 * signed range checks (< 0 || >= MAX_CPUS) into a single AND on
+	 * a copy register, which leaves the original register unbounded.
+	 */
+	__u32 orig_cpu = bpf_task_cpu(p);
+	__u32 dcpu = dest_cpu;
+	if (orig_cpu >= MAX_CPUS)
+		return 0;
+	if (dcpu >= MAX_CPUS)
 		return 0;
 
 	__s32 orig_numa = cpu_to_numa[orig_cpu];
-	__s32 dest_numa = cpu_to_numa[dest_cpu];
+	__s32 dest_numa = cpu_to_numa[dcpu];
 	if (orig_numa >= 0 && dest_numa >= 0 && orig_numa != dest_numa) {
 		__sync_fetch_and_add(&data->cross_numa_count, 1);
 	} else {
 		__s32 orig_die = cpu_to_die[orig_cpu];
-		__s32 dest_die = cpu_to_die[dest_cpu];
+		__s32 dest_die = cpu_to_die[dcpu];
 		if (orig_die >= 0 && dest_die >= 0 && orig_die != dest_die)
 			__sync_fetch_and_add(&data->cross_ccx_count, 1);
 	}
