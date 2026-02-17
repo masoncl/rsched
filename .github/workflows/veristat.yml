@@ -1,0 +1,52 @@
+name: veristat
+
+on:
+  push:
+
+env:
+  STABLE: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+  BPF_NEXT: https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git
+  VNG_PACKAGES: clang libelf-dev zlib1g-dev libpfm4-dev pkg-config
+  SCCACHE_GHA_ENABLED: true
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  veristat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [linux-6.13.y, linux-6.14.y, linux-6.15.y, linux-6.16.y, linux-6.18.y, linux-6.19.y, bpf-next]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          disable_annotations: true
+      - uses: swatinem/rust-cache@v2
+        with:
+          add-job-id-key: false
+          cache-on-failure: true
+
+      - name: Install tools
+        run: |
+          sudo apt-get -qq update && sudo apt-get -qq install -y libelf-dev zlib1g-dev
+          git clone -q --depth 1 --recurse-submodules https://github.com/libbpf/veristat /tmp/veristat
+          make -s -C /tmp/veristat/src -j$(nproc)
+          sudo install -m 755 /tmp/veristat/src/veristat /usr/local/bin/veristat
+          cargo install -q --git https://github.com/likewhatevs/cargo-veristat --locked
+
+      - uses: likewhatevs/vng-action@v0.1.0
+        with:
+          name: ${{ matrix.kernel }}
+          kernel-url: ${{ matrix.kernel == 'bpf-next' && env.BPF_NEXT || env.STABLE }}
+          kernel-tag: ${{ matrix.kernel == 'bpf-next' && 'master' || matrix.kernel }}
+          packages: ${{ env.VNG_PACKAGES }}
+          version: v6
+          kconfig: kernel.config
+          verbose: true
+          network: user
+          run: |
+            sudo setcap cap_bpf,cap_perfmon+ep $(which veristat)
+            cargo build --locked
+            cargo veristat --stderr-gfm 2>> "$GITHUB_STEP_SUMMARY"
