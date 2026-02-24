@@ -3,19 +3,8 @@ use crate::rsched_collector::Hist;
 use crate::rsched_stats::{FilterOptions, OutputMode};
 use std::collections::HashMap;
 
-#[repr(C)]
-#[derive(Default, Copy, Clone)]
-pub struct CpuPerfData {
-    pub user_cycles_hist: Hist,
-    pub kernel_cycles_hist: Hist,
-    pub total_user_cycles: u64,
-    pub total_kernel_cycles: u64,
-    pub total_user_instructions: u64,
-    pub total_kernel_instructions: u64,
-    pub sample_count: u64,
-}
-
-unsafe impl plain::Plain for CpuPerfData {}
+// CpuPerfData is now defined in rsched-common, re-exported via rsched_collector
+pub use rsched_common::CpuPerfData;
 
 pub struct CpuMetrics {
     pid_metrics: HashMap<u32, PidCpuMetrics>,

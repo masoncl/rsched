@@ -1,0 +1,12 @@
+[package]
+name = "rsched-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+rsched-common = { path = "../rsched-common" }
+
+[[bin]]
+name = "rsched"
+path = "src/main.rs"
