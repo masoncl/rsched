@@ -20,7 +20,7 @@ use aya_ebpf::{
 };
 use core::ffi::c_void;
 use rsched_common::*;
-use vmlinux::{cgroup, css_set, kernfs_node, task_struct};
+use vmlinux::{cgroup, css_set, kernfs_node, rq, task_struct};
 
 // ── rodata ───────────────────────────────────────────────────────────────────
 #[unsafe(no_mangle)]
@@ -87,6 +87,8 @@ static ZERO_MIGRATION: PerCpuArray<MigrationData> = PerCpuArray::with_max_entrie
 static ZERO_CPU_PERF: PerCpuArray<CpuPerfDataFull> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static ZERO_GENERIC_PERF: PerCpuArray<GenericPerfData> = PerCpuArray::with_max_entries(1, 0);
+#[map]
+static ZERO_NR_RUNNING: PerCpuArray<NrRunningData> = PerCpuArray::with_max_entries(1, 0);
 
 // Perf event arrays - used with bpf_perf_event_read_value for HW counters
 #[map]
@@ -201,6 +203,34 @@ unsafe fn task_cgid(t: *const task_struct) -> u64 {
     rf(&(*kn).id).unwrap_or(0)
 }
 
+/// Read task's CPU from thread_info.cpu (offset 20 in task_struct).
+#[inline(always)]
+unsafe fn task_cpu(t: *const task_struct) -> i32 {
+    rf(&(*t).thread_info.cpu).unwrap_or(0) as i32
+}
+
+/// Get nr_running via task->se.cfs_rq->rq->nr_running.
+/// Path: task_struct.se (offset 192) -> sched_entity.cfs_rq (offset 160)
+///       -> cfs_rq offset 16 is cfs_rq.nr_running (CFS only)
+///       To get rq.nr_running, we need cfs_rq.rq (need to find offset)
+/// For simplicity, read rq.nr_running via the cfs_rq's rq pointer.
+#[inline(always)]
+unsafe fn rq_nr_running_from_task(t: *const task_struct) -> u64 {
+    // task->se.cfs_rq: se is at offset 192, cfs_rq is at offset 160 within se
+    // So absolute offset = 192 + 160 = 352
+    let cfs_rq_ptr_addr = (t as *const u8).add(352) as *const *const u8;
+    let cfs_rq: *const u8 = match rf(cfs_rq_ptr_addr) {
+        Some(p) if !p.is_null() => p,
+        _ => return 0,
+    };
+    // cfs_rq.nr_running is at offset 16
+    let nr = match rf((cfs_rq.add(16)) as *const u32) {
+        Some(v) => v,
+        _ => return 0,
+    };
+    nr as u64
+}
+
 const TASK_RUNNING: u32 = 0;
 
 // ── wakeup ───────────────────────────────────────────────────────────────────
@@ -209,6 +239,27 @@ unsafe fn do_wakeup(t: *const task_struct) -> i32 {
     let pid = task_pid(t);
     let ts = bpf_ktime_get_ns();
 
+    // Record nr_running on the target CPU's runqueue
+    if pid != 0 {
+        let nr = rq_nr_running_from_task(t);
+        if nr > 0 {
+            if NR_RUNNING_HISTS.get_ptr(&pid).is_none() {
+                if let Some(z) = ZERO_NR_RUNNING.get_ptr(0) {
+                    let _ = NR_RUNNING_HISTS.insert(&pid, &*z, BPF_NOEXIST as u64);
+                }
+                if let Some(p) = NR_RUNNING_HISTS.get_ptr_mut(&pid) {
+                    task_comm(&mut (*p).comm, t);
+                    (*p).cgroup_id = task_cgid(t);
+                }
+            }
+            if let Some(p) = NR_RUNNING_HISTS.get_ptr_mut(&pid) {
+                let s = slot_idx(nr as u32);
+                add32(&mut (*p).hist.slots[s], 1);
+            }
+        }
+    }
+
+    // Handle sleep duration calculation
     if pid != 0 {
         if let Some(ss) = SLEEP_TIME.get_ptr(&pid) {
             let dur = ts - *ss;
