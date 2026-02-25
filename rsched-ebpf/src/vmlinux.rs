@@ -83,6 +83,21 @@ impl task_struct {
         unsafe { bpf_helpers::probe_read_str(self.comm.as_ptr() as *const u8, buf) };
     }
 
+    /// Read the task's comm into a destination given as a raw pointer.
+    ///
+    /// This is the volatile-compatible variant of [`read_comm`](Self::read_comm)
+    /// for use with [`MapPtr`](crate::map_ops::MapPtr) field projection.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must point to a valid, aligned, writable `[u8; TASK_COMM_LEN]`.
+    #[inline(always)]
+    pub unsafe fn read_comm_ptr(&self, buf: *mut [u8; TASK_COMM_LEN]) {
+        // SAFETY: caller guarantees buf is valid; the brief &mut is immediately
+        // decomposed into ptr+len by bpf_probe_read_kernel_str_bytes.
+        unsafe { bpf_helpers::probe_read_str(self.comm.as_ptr() as *const u8, &mut *buf) };
+    }
+
     #[inline(always)]
     pub fn cgroup_id(&self) -> u64 {
         // SAFETY: each probe_read targets a kernel address either derived from

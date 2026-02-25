@@ -20,7 +20,7 @@ use aya_ebpf::{
     EbpfContext,
 };
 use bpf_helpers::{current_cpu, ktime_ns, read_perf_counter, read_volatile_i32, read_volatile_u32};
-use map_ops::{add_to_u32, add_to_u64};
+use map_ops::{add_to_u32, add_to_u64, volatile_write};
 use rsched_common::*;
 use vmlinux::task_struct;
 
@@ -145,14 +145,16 @@ fn do_wakeup(t: *const task_struct) -> i32 {
                 if let Some(z) = map_ops::pca_get(&ZERO_NR_RUNNING, 0) {
                     let _ = NR_RUNNING_HISTS.insert(&pid, z, BPF_NOEXIST as u64);
                 }
-                if let Some(p) = map_ops::get_mut(&NR_RUNNING_HISTS, &pid) {
-                    t.read_comm(&mut p.comm);
-                    p.cgroup_id = t.cgroup_id();
+                if let Some(p) = map_ops::get(&NR_RUNNING_HISTS, &pid) {
+                    unsafe {
+                        t.read_comm_ptr(field_ptr!(p, comm));
+                        volatile_write(field_ptr!(p, cgroup_id), t.cgroup_id());
+                    }
                 }
             }
-            if let Some(p) = map_ops::get_mut(&NR_RUNNING_HISTS, &pid) {
+            if let Some(p) = map_ops::get(&NR_RUNNING_HISTS, &pid) {
                 let s = slot_idx(nr as u32);
-                add_to_u32(&mut p.hist.slots[s], 1);
+                unsafe { add_to_u32(field_ptr!(p, hist.slots[s]), 1) };
             }
         }
     }
@@ -160,20 +162,22 @@ fn do_wakeup(t: *const task_struct) -> i32 {
     // Handle sleep duration calculation
     if pid != 0 {
         if let Some(ss) = map_ops::get(&SLEEP_TIME, &pid) {
-            let dur = ts - *ss;
+            let dur = ts - ss.read();
             if dur < 3_600_000_000_000 {
                 if !map_ops::contains_key(&SLEEP_HISTS, &pid) {
                     if let Some(z) = map_ops::pca_get(&ZERO_HIST_DATA, 0) {
                         let _ = SLEEP_HISTS.insert(&pid, z, BPF_NOEXIST as u64);
                     }
-                    if let Some(p) = map_ops::get_mut(&SLEEP_HISTS, &pid) {
-                        t.read_comm(&mut p.comm);
-                        p.cgroup_id = t.cgroup_id();
+                    if let Some(p) = map_ops::get(&SLEEP_HISTS, &pid) {
+                        unsafe {
+                            t.read_comm_ptr(field_ptr!(p, comm));
+                            volatile_write(field_ptr!(p, cgroup_id), t.cgroup_id());
+                        }
                     }
                 }
-                if let Some(p) = map_ops::get_mut(&SLEEP_HISTS, &pid) {
+                if let Some(p) = map_ops::get(&SLEEP_HISTS, &pid) {
                     let s = slot_idx(hist_slot(dur));
-                    add_to_u32(&mut p.hist.slots[s], 1);
+                    unsafe { add_to_u32(field_ptr!(p, hist.slots[s]), 1) };
                 }
             }
             let _ = SLEEP_TIME.remove(&pid);
@@ -257,7 +261,7 @@ fn do_timeslice(pp: u32, prev: &task_struct, now: u64, inv: bool) {
         return;
     }
     let ots = match map_ops::get(&ONCPU_TIME, &pp) {
-        Some(p) => *p,
+        Some(p) => p.read(),
         None => return,
     };
     let ts = now - ots;
@@ -266,19 +270,23 @@ fn do_timeslice(pp: u32, prev: &task_struct, now: u64, inv: bool) {
         if let Some(z) = map_ops::pca_get(&ZERO_TIMESLICE, 0) {
             let _ = TIMESLICE_HISTS.insert(&pp, z, BPF_NOEXIST as u64);
         }
-        if let Some(p) = map_ops::get_mut(&TIMESLICE_HISTS, &pp) {
-            prev.read_comm(&mut p.comm);
-            p.cgroup_id = prev.cgroup_id();
+        if let Some(p) = map_ops::get(&TIMESLICE_HISTS, &pp) {
+            unsafe {
+                prev.read_comm_ptr(field_ptr!(p, comm));
+                volatile_write(field_ptr!(p, cgroup_id), prev.cgroup_id());
+            }
         }
     }
     if ts < 10_000_000_000 {
         let s = slot_idx(hist_slot(ts));
-        if let Some(p) = map_ops::get_mut(&TIMESLICE_HISTS, &pp) {
-            if inv {
-                add_to_u32(&mut p.stats.involuntary.slots[s], 1);
-                add_to_u64(&mut p.stats.involuntary_count, 1);
-            } else {
-                add_to_u32(&mut p.stats.voluntary.slots[s], 1);
+        if let Some(p) = map_ops::get(&TIMESLICE_HISTS, &pp) {
+            unsafe {
+                if inv {
+                    add_to_u32(field_ptr!(p, stats.involuntary.slots[s]), 1);
+                    add_to_u64(field_ptr!(p, stats.involuntary_count), 1);
+                } else {
+                    add_to_u32(field_ptr!(p, stats.voluntary.slots[s]), 1);
+                }
             }
         }
     }
@@ -288,7 +296,7 @@ fn do_timeslice(pp: u32, prev: &task_struct, now: u64, inv: bool) {
 #[inline(always)]
 fn do_queue_delay(np: u32, next: &task_struct, now: u64) {
     let st = match map_ops::get(&ENQUEUE_TIME, &np) {
-        Some(p) => *p,
+        Some(p) => p.read(),
         None => return,
     };
     let d = now - st;
@@ -301,13 +309,15 @@ fn do_queue_delay(np: u32, next: &task_struct, now: u64) {
         if let Some(z) = map_ops::pca_get(&ZERO_HIST_DATA, 0) {
             let _ = HISTS.insert(&np, z, BPF_NOEXIST as u64);
         }
-        if let Some(p) = map_ops::get_mut(&HISTS, &np) {
-            next.read_comm(&mut p.comm);
-            p.cgroup_id = next.cgroup_id();
+        if let Some(p) = map_ops::get(&HISTS, &np) {
+            unsafe {
+                next.read_comm_ptr(field_ptr!(p, comm));
+                volatile_write(field_ptr!(p, cgroup_id), next.cgroup_id());
+            }
         }
     }
-    if let Some(p) = map_ops::get_mut(&HISTS, &np) {
-        add_to_u32(&mut p.hist.slots[s], 1);
+    if let Some(p) = map_ops::get(&HISTS, &np) {
+        unsafe { add_to_u32(field_ptr!(p, hist.slots[s]), 1) };
     }
 
     let cpu = current_cpu();
@@ -316,8 +326,8 @@ fn do_queue_delay(np: u32, next: &task_struct, now: u64) {
             let _ = CPU_HISTS.insert(&cpu, z, BPF_NOEXIST as u64);
         }
     }
-    if let Some(p) = map_ops::get_mut(&CPU_HISTS, &cpu) {
-        add_to_u32(&mut p.slots[s], 1);
+    if let Some(p) = map_ops::get(&CPU_HISTS, &cpu) {
+        unsafe { add_to_u32(field_ptr!(p, slots[s]), 1) };
     }
 }
 
@@ -327,7 +337,7 @@ fn do_waking_delay(np: u32, next: &task_struct, now: u64) {
         return;
     }
     let st = match map_ops::get(&WAKING_TIME, &np) {
-        Some(p) => *p,
+        Some(p) => p.read(),
         None => return,
     };
     let d = now - st;
@@ -339,14 +349,16 @@ fn do_waking_delay(np: u32, next: &task_struct, now: u64) {
         if let Some(z) = map_ops::pca_get(&ZERO_WAKING, 0) {
             let _ = WAKING_DELAY.insert(&np, z, BPF_NOEXIST as u64);
         }
-        if let Some(p) = map_ops::get_mut(&WAKING_DELAY, &np) {
-            next.read_comm(&mut p.comm);
-            p.cgroup_id = next.cgroup_id();
+        if let Some(p) = map_ops::get(&WAKING_DELAY, &np) {
+            unsafe {
+                next.read_comm_ptr(field_ptr!(p, comm));
+                volatile_write(field_ptr!(p, cgroup_id), next.cgroup_id());
+            }
         }
     }
     let s = slot_idx(hist_slot(d));
-    if let Some(p) = map_ops::get_mut(&WAKING_DELAY, &np) {
-        add_to_u32(&mut p.hist.slots[s], 1);
+    if let Some(p) = map_ops::get(&WAKING_DELAY, &np) {
+        unsafe { add_to_u32(field_ptr!(p, hist.slots[s]), 1) };
     }
 }
 
@@ -362,9 +374,9 @@ fn do_cpu_idle(cpu: u32, now: u64) {
                         let _ = CPU_IDLE_HISTS.insert(&cpu, z, BPF_NOEXIST as u64);
                     }
                 }
-                if let Some(p) = map_ops::get_mut(&CPU_IDLE_HISTS, &cpu) {
+                if let Some(p) = map_ops::get(&CPU_IDLE_HISTS, &cpu) {
                     let s = slot_idx(hist_slot(dur));
-                    add_to_u32(&mut p.slots[s], 1);
+                    unsafe { add_to_u32(field_ptr!(p, slots[s]), 1) };
                 }
             }
             if let Some(p) = map_ops::pca_get_mut(&CPU_IDLE_TIME, 0) {
@@ -411,25 +423,29 @@ fn do_cpu_perf(pp: u32, np: u32, prev: &task_struct) {
             if let Some(z) = map_ops::pca_get(&ZERO_CPU_PERF, 0) {
                 let _ = CPU_PERF_STATS.insert(&pp, z, BPF_NOEXIST as u64);
             }
-            if let Some(p) = map_ops::get_mut(&CPU_PERF_STATS, &pp) {
-                prev.read_comm(&mut p.comm);
-                p.cgroup_id = prev.cgroup_id();
+            if let Some(p) = map_ops::get(&CPU_PERF_STATS, &pp) {
+                unsafe {
+                    prev.read_comm_ptr(field_ptr!(p, comm));
+                    volatile_write(field_ptr!(p, cgroup_id), prev.cgroup_id());
+                }
             }
         }
-        if let Some(p) = map_ops::get_mut(&CPU_PERF_STATS, &pp) {
-            if duc > 0 {
-                let s = slot_idx(log2_slot(duc));
-                add_to_u32(&mut p.data.user_cycles_hist.slots[s], 1);
+        if let Some(p) = map_ops::get(&CPU_PERF_STATS, &pp) {
+            unsafe {
+                if duc > 0 {
+                    let s = slot_idx(log2_slot(duc));
+                    add_to_u32(field_ptr!(p, data.user_cycles_hist.slots[s]), 1);
+                }
+                if dkc > 0 {
+                    let s = slot_idx(log2_slot(dkc));
+                    add_to_u32(field_ptr!(p, data.kernel_cycles_hist.slots[s]), 1);
+                }
+                add_to_u64(field_ptr!(p, data.total_user_cycles), duc);
+                add_to_u64(field_ptr!(p, data.total_kernel_cycles), dkc);
+                add_to_u64(field_ptr!(p, data.total_user_instructions), dui);
+                add_to_u64(field_ptr!(p, data.total_kernel_instructions), dki);
+                add_to_u64(field_ptr!(p, data.sample_count), 1);
             }
-            if dkc > 0 {
-                let s = slot_idx(log2_slot(dkc));
-                add_to_u32(&mut p.data.kernel_cycles_hist.slots[s], 1);
-            }
-            add_to_u64(&mut p.data.total_user_cycles, duc);
-            add_to_u64(&mut p.data.total_kernel_cycles, dkc);
-            add_to_u64(&mut p.data.total_user_instructions, dui);
-            add_to_u64(&mut p.data.total_kernel_instructions, dki);
-            add_to_u64(&mut p.data.sample_count, 1);
         }
     }
     ctx.last_user_cycles = uc;
@@ -451,18 +467,20 @@ fn do_generic_perf(pp: u32, np: u32, prev: &task_struct) {
     };
     let has_prev = ctx.running_pid == pp && pp != 0;
 
-    let mut data: Option<&mut GenericPerfData> = None;
+    let mut data: Option<map_ops::MapPtr<GenericPerfData>> = None;
     if has_prev {
         if !map_ops::contains_key(&GENERIC_PERF_STATS, &pp) {
             if let Some(z) = map_ops::pca_get(&ZERO_GENERIC_PERF, 0) {
                 let _ = GENERIC_PERF_STATS.insert(&pp, z, BPF_NOEXIST as u64);
             }
-            if let Some(p) = map_ops::get_mut(&GENERIC_PERF_STATS, &pp) {
-                prev.read_comm(&mut p.comm);
-                p.cgroup_id = prev.cgroup_id();
+            if let Some(p) = map_ops::get(&GENERIC_PERF_STATS, &pp) {
+                unsafe {
+                    prev.read_comm_ptr(field_ptr!(p, comm));
+                    volatile_write(field_ptr!(p, cgroup_id), prev.cgroup_id());
+                }
             }
         }
-        data = map_ops::get_mut(&GENERIC_PERF_STATS, &pp);
+        data = map_ops::get(&GENERIC_PERF_STATS, &pp);
     }
 
     macro_rules! slot {
@@ -480,14 +498,14 @@ fn do_generic_perf(pp: u32, np: u32, prev: &task_struct) {
                     _ => 0,
                 };
                 if has_prev {
-                    if let Some(ref mut p) = data {
+                    if let Some(p) = data {
                         let d = if cur >= ctx.last_values[$i] {
                             cur - ctx.last_values[$i]
                         } else {
                             0
                         };
                         if d > 0 {
-                            add_to_u64(&mut p.counters[$i], d);
+                            unsafe { add_to_u64(field_ptr!(p, counters[$i]), d) };
                         }
                     }
                 }
@@ -519,24 +537,26 @@ fn do_migrate(t: *const task_struct, dest_cpu: i32) -> i32 {
         if let Some(z) = map_ops::pca_get(&ZERO_MIGRATION, 0) {
             let _ = MIGRATION_COUNTS.insert(&pid, z, BPF_NOEXIST as u64);
         }
-        if let Some(p) = map_ops::get_mut(&MIGRATION_COUNTS, &pid) {
-            t.read_comm(&mut p.comm);
-            p.cgroup_id = t.cgroup_id();
+        if let Some(p) = map_ops::get(&MIGRATION_COUNTS, &pid) {
+            unsafe {
+                t.read_comm_ptr(field_ptr!(p, comm));
+                volatile_write(field_ptr!(p, cgroup_id), t.cgroup_id());
+            }
         }
     }
-    if let Some(p) = map_ops::get_mut(&MIGRATION_COUNTS, &pid) {
-        add_to_u64(&mut p.count, 1);
+    if let Some(p) = map_ops::get(&MIGRATION_COUNTS, &pid) {
+        unsafe { add_to_u64(field_ptr!(p, count), 1) };
         let oc = t.wake_cpu();
         if oc >= 0 && oc < MAX_CPUS as i32 && dest_cpu >= 0 && dest_cpu < MAX_CPUS as i32 {
             let on = read_volatile_i32(&CPU_TO_NUMA[oc as usize]);
             let dn = read_volatile_i32(&CPU_TO_NUMA[dest_cpu as usize]);
             if on >= 0 && dn >= 0 && on != dn {
-                add_to_u64(&mut p.cross_numa_count, 1);
+                unsafe { add_to_u64(field_ptr!(p, cross_numa_count), 1) };
             } else {
                 let od = read_volatile_i32(&CPU_TO_DIE[oc as usize]);
                 let dd = read_volatile_i32(&CPU_TO_DIE[dest_cpu as usize]);
                 if od >= 0 && dd >= 0 && od != dd {
-                    add_to_u64(&mut p.cross_ccx_count, 1);
+                    unsafe { add_to_u64(field_ptr!(p, cross_ccx_count), 1) };
                 }
             }
         }
