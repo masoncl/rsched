@@ -21,6 +21,9 @@
 //! kernfs_node offsets:
 //!   id: 96
 
+use crate::bpf_helpers;
+use rsched_common::TASK_COMM_LEN;
+
 #[repr(C)]
 pub struct thread_info {
     pub flags: u64,
@@ -41,6 +44,68 @@ pub struct task_struct {
     pub comm: [i8; 16],           // offset 2224
     _pad4: [u8; 472],             // 2240 to 2712
     pub cgroups: *mut css_set,    // offset 2712
+}
+
+impl task_struct {
+    #[inline(always)]
+    pub fn pid(&self) -> u32 {
+        bpf_helpers::probe_read(&self.pid).unwrap_or(0) as u32
+    }
+
+    #[inline(always)]
+    pub fn state(&self) -> u32 {
+        bpf_helpers::probe_read(&self.__state).unwrap_or(0)
+    }
+
+    #[inline(always)]
+    pub fn cpu(&self) -> i32 {
+        bpf_helpers::probe_read(&self.thread_info.cpu).unwrap_or(0) as i32
+    }
+
+    #[inline(always)]
+    pub fn wake_cpu(&self) -> i32 {
+        bpf_helpers::probe_read(&self.wake_cpu).unwrap_or(-1)
+    }
+
+    #[inline(always)]
+    pub fn read_comm(&self, buf: &mut [u8; TASK_COMM_LEN]) {
+        bpf_helpers::probe_read_str(self.comm.as_ptr() as *const u8, buf);
+    }
+
+    #[inline(always)]
+    pub fn cgroup_id(&self) -> u64 {
+        let cs: *const css_set = match bpf_helpers::probe_read(&self.cgroups) {
+            Some(p) if !p.is_null() => p,
+            _ => return 0,
+        };
+        let cg: *const cgroup = match bpf_helpers::probe_read(unsafe { &(*cs).dfl_cgrp }) {
+            Some(p) if !p.is_null() => p,
+            _ => return 0,
+        };
+        let kn: *const kernfs_node = match bpf_helpers::probe_read(unsafe { &(*cg).kn }) {
+            Some(p) if !p.is_null() => p,
+            _ => return 0,
+        };
+        bpf_helpers::probe_read(unsafe { &(*kn).id }).unwrap_or(0)
+    }
+
+    /// Get nr_running via task->se.cfs_rq->nr_running.
+    /// Path: se at offset 192, cfs_rq at offset 160 within se (absolute 352).
+    /// cfs_rq.nr_running at offset 16.
+    #[inline(always)]
+    pub fn cfs_rq_nr_running(&self) -> u64 {
+        let cfs_rq_ptr_addr =
+            unsafe { (self as *const _ as *const u8).add(352) as *const *const u8 };
+        let cfs_rq: *const u8 = match bpf_helpers::probe_read(cfs_rq_ptr_addr) {
+            Some(p) if !p.is_null() => p,
+            _ => return 0,
+        };
+        let nr_addr = unsafe { cfs_rq.add(16) as *const u32 };
+        match bpf_helpers::probe_read(nr_addr) {
+            Some(v) => v as u64,
+            _ => 0,
+        }
+    }
 }
 
 #[repr(C)]

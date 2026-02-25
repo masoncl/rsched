@@ -8,19 +8,22 @@
     unused_imports
 )]
 
+mod bpf_helpers;
 mod vmlinux;
 
 use aya_ebpf::{
-    bindings::{bpf_perf_event_value, BPF_ANY, BPF_NOEXIST},
-    helpers::{self, bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_probe_read_kernel},
+    bindings::{BPF_ANY, BPF_NOEXIST},
     macros::{btf_tracepoint, map, raw_tracepoint},
     maps::{HashMap, PerCpuArray, PerfEventArray},
     programs::{BtfTracePointContext, RawTracePointContext},
     EbpfContext,
 };
-use core::ffi::c_void;
+use bpf_helpers::{
+    add_to_u32, add_to_u64, current_cpu, ktime_ns, read_perf_counter, read_volatile_i32,
+    read_volatile_u32,
+};
 use rsched_common::*;
-use vmlinux::{cgroup, css_set, kernfs_node, rq, task_struct};
+use vmlinux::task_struct;
 
 // ── rodata ───────────────────────────────────────────────────────────────────
 #[unsafe(no_mangle)]
@@ -117,50 +120,6 @@ static GENERIC_PERF_ARRAY_6: PerfEventArray<u32> = PerfEventArray::new(0);
 static GENERIC_PERF_ARRAY_7: PerfEventArray<u32> = PerfEventArray::new(0);
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-#[inline(always)]
-fn trace_waking() -> bool {
-    unsafe { core::ptr::read_volatile(&TRACE_SCHED_WAKING) != 0 }
-}
-#[inline(always)]
-fn n_generic() -> u32 {
-    unsafe { core::ptr::read_volatile(&NUM_GENERIC_EVENTS) }
-}
-
-#[inline(always)]
-unsafe fn read_perf(map: &PerfEventArray<u32>) -> u64 {
-    let cpu = bpf_get_smp_processor_id();
-    let mut val = bpf_perf_event_value {
-        counter: 0,
-        enabled: 0,
-        running: 0,
-    };
-    let ret = helpers::gen::bpf_perf_event_read_value(
-        map as *const _ as *mut c_void,
-        cpu as u64,
-        &mut val as *mut _ as *mut _,
-        core::mem::size_of::<bpf_perf_event_value>() as u32,
-    );
-    if ret == 0 {
-        val.counter
-    } else {
-        0
-    }
-}
-
-#[inline(always)]
-fn add32(ptr: *mut u32, val: u32) {
-    unsafe {
-        let o = core::ptr::read_volatile(ptr);
-        core::ptr::write_volatile(ptr, o.wrapping_add(val));
-    }
-}
-#[inline(always)]
-fn add64(ptr: *mut u64, val: u64) {
-    unsafe {
-        let o = core::ptr::read_volatile(ptr);
-        core::ptr::write_volatile(ptr, o.wrapping_add(val));
-    }
-}
 
 /// Bounds-checked slot index that the BPF verifier can track.
 /// Uses bitwise AND to clamp to [0, MAX_SLOTS-1].
@@ -169,92 +128,30 @@ fn slot_idx(s: u32) -> usize {
     (s & (MAX_SLOTS as u32 - 1)) as usize
 }
 
-#[inline(always)]
-unsafe fn rf<T: Copy>(ptr: *const T) -> Option<T> {
-    bpf_probe_read_kernel(ptr).ok()
-}
-
-#[inline(always)]
-unsafe fn task_pid(t: *const task_struct) -> u32 {
-    rf(&(*t).pid).unwrap_or(0) as u32
-}
-#[inline(always)]
-unsafe fn task_state(t: *const task_struct) -> u32 {
-    rf(&(*t).__state).unwrap_or(0)
-}
-#[inline(always)]
-unsafe fn task_comm(d: &mut [u8; TASK_COMM_LEN], t: *const task_struct) {
-    let _ = helpers::bpf_probe_read_kernel_str_bytes((*t).comm.as_ptr() as *const u8, d);
-}
-#[inline(always)]
-unsafe fn task_cgid(t: *const task_struct) -> u64 {
-    let cs: *const css_set = match rf(&(*t).cgroups) {
-        Some(p) if !p.is_null() => p,
-        _ => return 0,
-    };
-    let cg: *const cgroup = match rf(&(*cs).dfl_cgrp) {
-        Some(p) if !p.is_null() => p,
-        _ => return 0,
-    };
-    let kn: *const kernfs_node = match rf(&(*cg).kn) {
-        Some(p) if !p.is_null() => p,
-        _ => return 0,
-    };
-    rf(&(*kn).id).unwrap_or(0)
-}
-
-/// Read task's CPU from thread_info.cpu (offset 20 in task_struct).
-#[inline(always)]
-unsafe fn task_cpu(t: *const task_struct) -> i32 {
-    rf(&(*t).thread_info.cpu).unwrap_or(0) as i32
-}
-
-/// Get nr_running via task->se.cfs_rq->rq->nr_running.
-/// Path: task_struct.se (offset 192) -> sched_entity.cfs_rq (offset 160)
-///       -> cfs_rq offset 16 is cfs_rq.nr_running (CFS only)
-///       To get rq.nr_running, we need cfs_rq.rq (need to find offset)
-/// For simplicity, read rq.nr_running via the cfs_rq's rq pointer.
-#[inline(always)]
-unsafe fn rq_nr_running_from_task(t: *const task_struct) -> u64 {
-    // task->se.cfs_rq: se is at offset 192, cfs_rq is at offset 160 within se
-    // So absolute offset = 192 + 160 = 352
-    let cfs_rq_ptr_addr = (t as *const u8).add(352) as *const *const u8;
-    let cfs_rq: *const u8 = match rf(cfs_rq_ptr_addr) {
-        Some(p) if !p.is_null() => p,
-        _ => return 0,
-    };
-    // cfs_rq.nr_running is at offset 16
-    let nr = match rf((cfs_rq.add(16)) as *const u32) {
-        Some(v) => v,
-        _ => return 0,
-    };
-    nr as u64
-}
-
 const TASK_RUNNING: u32 = 0;
 
 // ── wakeup ───────────────────────────────────────────────────────────────────
 #[inline(always)]
 unsafe fn do_wakeup(t: *const task_struct) -> i32 {
-    let pid = task_pid(t);
-    let ts = bpf_ktime_get_ns();
+    let pid = (*t).pid();
+    let ts = ktime_ns();
 
     // Record nr_running on the target CPU's runqueue
     if pid != 0 {
-        let nr = rq_nr_running_from_task(t);
+        let nr = (*t).cfs_rq_nr_running();
         if nr > 0 {
             if NR_RUNNING_HISTS.get_ptr(&pid).is_none() {
                 if let Some(z) = ZERO_NR_RUNNING.get_ptr(0) {
                     let _ = NR_RUNNING_HISTS.insert(&pid, &*z, BPF_NOEXIST as u64);
                 }
                 if let Some(p) = NR_RUNNING_HISTS.get_ptr_mut(&pid) {
-                    task_comm(&mut (*p).comm, t);
-                    (*p).cgroup_id = task_cgid(t);
+                    (*t).read_comm(&mut (*p).comm);
+                    (*p).cgroup_id = (*t).cgroup_id();
                 }
             }
             if let Some(p) = NR_RUNNING_HISTS.get_ptr_mut(&pid) {
                 let s = slot_idx(nr as u32);
-                add32(&mut (*p).hist.slots[s], 1);
+                add_to_u32(&mut (*p).hist.slots[s], 1);
             }
         }
     }
@@ -269,13 +166,13 @@ unsafe fn do_wakeup(t: *const task_struct) -> i32 {
                         let _ = SLEEP_HISTS.insert(&pid, &*z, BPF_NOEXIST as u64);
                     }
                     if let Some(p) = SLEEP_HISTS.get_ptr_mut(&pid) {
-                        task_comm(&mut (*p).comm, t);
-                        (*p).cgroup_id = task_cgid(t);
+                        (*t).read_comm(&mut (*p).comm);
+                        (*p).cgroup_id = (*t).cgroup_id();
                     }
                 }
                 if let Some(p) = SLEEP_HISTS.get_ptr_mut(&pid) {
                     let s = slot_idx(hist_slot(dur));
-                    add32(&mut (*p).hist.slots[s], 1);
+                    add_to_u32(&mut (*p).hist.slots[s], 1);
                 }
             }
             let _ = SLEEP_TIME.remove(&pid);
@@ -290,12 +187,12 @@ unsafe fn do_wakeup(t: *const task_struct) -> i32 {
 // ── waking ───────────────────────────────────────────────────────────────────
 #[inline(always)]
 unsafe fn do_waking(t: *const task_struct) -> i32 {
-    if !trace_waking() {
+    if read_volatile_u32(&TRACE_SCHED_WAKING) == 0 {
         return 0;
     }
-    let pid = task_pid(t);
-    let ts = bpf_ktime_get_ns();
-    let st = task_state(t);
+    let pid = (*t).pid();
+    let ts = ktime_ns();
+    let st = (*t).state();
     if st != TASK_RUNNING && st != 0x200 && pid != 0 {
         let _ = WAKING_TIME.insert(&pid, &ts, BPF_ANY as u64);
     }
@@ -305,10 +202,10 @@ unsafe fn do_waking(t: *const task_struct) -> i32 {
 // ── switch ───────────────────────────────────────────────────────────────────
 #[inline(always)]
 unsafe fn do_switch(prev: *const task_struct, next: *const task_struct) -> i32 {
-    let np = task_pid(next);
-    let pp = task_pid(prev);
-    let now = bpf_ktime_get_ns();
-    let cpu = bpf_get_smp_processor_id();
+    let np = (*next).pid();
+    let pp = (*prev).pid();
+    let now = ktime_ns();
+    let cpu = current_cpu();
 
     if pp == 0 && np != 0 {
         do_cpu_idle(cpu, now);
@@ -318,13 +215,13 @@ unsafe fn do_switch(prev: *const task_struct, next: *const task_struct) -> i32 {
         }
     }
 
-    let ps = task_state(prev);
+    let ps = (*prev).state();
     let inv = ps == TASK_RUNNING;
     if inv {
         if pp != 0 {
             let _ = ENQUEUE_TIME.insert(&pp, &now, BPF_ANY as u64);
         }
-        if trace_waking() && pp != 0 {
+        if read_volatile_u32(&TRACE_SCHED_WAKING) != 0 && pp != 0 {
             let _ = WAKING_TIME.insert(&pp, &now, BPF_ANY as u64);
         }
     } else if pp != 0 {
@@ -338,7 +235,7 @@ unsafe fn do_switch(prev: *const task_struct, next: *const task_struct) -> i32 {
         do_queue_delay(np, next, now);
         do_waking_delay(np, next, now);
         let _ = ENQUEUE_TIME.remove(&np);
-        if trace_waking() {
+        if read_volatile_u32(&TRACE_SCHED_WAKING) != 0 {
             let _ = WAKING_TIME.remove(&np);
         }
     }
@@ -364,18 +261,18 @@ unsafe fn do_timeslice(pp: u32, prev: *const task_struct, now: u64, inv: bool) {
             let _ = TIMESLICE_HISTS.insert(&pp, &*z, BPF_NOEXIST as u64);
         }
         if let Some(p) = TIMESLICE_HISTS.get_ptr_mut(&pp) {
-            task_comm(&mut (*p).comm, prev);
-            (*p).cgroup_id = task_cgid(prev);
+            (*prev).read_comm(&mut (*p).comm);
+            (*p).cgroup_id = (*prev).cgroup_id();
         }
     }
     if ts < 10_000_000_000 {
         let s = slot_idx(hist_slot(ts));
         if let Some(p) = TIMESLICE_HISTS.get_ptr_mut(&pp) {
             if inv {
-                add32(&mut (*p).stats.involuntary.slots[s], 1);
-                add64(&mut (*p).stats.involuntary_count, 1);
+                add_to_u32(&mut (*p).stats.involuntary.slots[s], 1);
+                add_to_u64(&mut (*p).stats.involuntary_count, 1);
             } else {
-                add32(&mut (*p).stats.voluntary.slots[s], 1);
+                add_to_u32(&mut (*p).stats.voluntary.slots[s], 1);
             }
         }
     }
@@ -399,28 +296,28 @@ unsafe fn do_queue_delay(np: u32, next: *const task_struct, now: u64) {
             let _ = HISTS.insert(&np, &*z, BPF_NOEXIST as u64);
         }
         if let Some(p) = HISTS.get_ptr_mut(&np) {
-            task_comm(&mut (*p).comm, next);
-            (*p).cgroup_id = task_cgid(next);
+            (*next).read_comm(&mut (*p).comm);
+            (*p).cgroup_id = (*next).cgroup_id();
         }
     }
     if let Some(p) = HISTS.get_ptr_mut(&np) {
-        add32(&mut (*p).hist.slots[s], 1);
+        add_to_u32(&mut (*p).hist.slots[s], 1);
     }
 
-    let cpu = bpf_get_smp_processor_id();
+    let cpu = current_cpu();
     if CPU_HISTS.get_ptr(&cpu).is_none() {
         if let Some(z) = ZERO_HIST.get_ptr(0) {
             let _ = CPU_HISTS.insert(&cpu, &*z, BPF_NOEXIST as u64);
         }
     }
     if let Some(p) = CPU_HISTS.get_ptr_mut(&cpu) {
-        add32(&mut (*p).slots[s], 1);
+        add_to_u32(&mut (*p).slots[s], 1);
     }
 }
 
 #[inline(always)]
 unsafe fn do_waking_delay(np: u32, next: *const task_struct, now: u64) {
-    if !trace_waking() {
+    if read_volatile_u32(&TRACE_SCHED_WAKING) == 0 {
         return;
     }
     let st = match WAKING_TIME.get_ptr(&np) {
@@ -437,13 +334,13 @@ unsafe fn do_waking_delay(np: u32, next: *const task_struct, now: u64) {
             let _ = WAKING_DELAY.insert(&np, &*z, BPF_NOEXIST as u64);
         }
         if let Some(p) = WAKING_DELAY.get_ptr_mut(&np) {
-            task_comm(&mut (*p).comm, next);
-            (*p).cgroup_id = task_cgid(next);
+            (*next).read_comm(&mut (*p).comm);
+            (*p).cgroup_id = (*next).cgroup_id();
         }
     }
     let s = slot_idx(hist_slot(d));
     if let Some(p) = WAKING_DELAY.get_ptr_mut(&np) {
-        add32(&mut (*p).hist.slots[s], 1);
+        add_to_u32(&mut (*p).hist.slots[s], 1);
     }
 }
 
@@ -461,7 +358,7 @@ unsafe fn do_cpu_idle(cpu: u32, now: u64) {
                 }
                 if let Some(p) = CPU_IDLE_HISTS.get_ptr_mut(&cpu) {
                     let s = slot_idx(hist_slot(dur));
-                    add32(&mut (*p).slots[s], 1);
+                    add_to_u32(&mut (*p).slots[s], 1);
                 }
             }
             if let Some(p) = CPU_IDLE_TIME.get_ptr_mut(0) {
@@ -477,10 +374,10 @@ unsafe fn do_cpu_perf(pp: u32, np: u32, prev: *const task_struct) {
         Some(p) => p,
         None => return,
     };
-    let uc = read_perf(&USER_CYCLES_ARRAY);
-    let kc = read_perf(&KERNEL_CYCLES_ARRAY);
-    let ui = read_perf(&USER_INSTRUCTIONS_ARRAY);
-    let ki = read_perf(&KERNEL_INSTRUCTIONS_ARRAY);
+    let uc = read_perf_counter(&USER_CYCLES_ARRAY);
+    let kc = read_perf_counter(&KERNEL_CYCLES_ARRAY);
+    let ui = read_perf_counter(&USER_INSTRUCTIONS_ARRAY);
+    let ki = read_perf_counter(&KERNEL_INSTRUCTIONS_ARRAY);
 
     if (*ctx).running_pid == pp && pp != 0 {
         let duc = if uc >= (*ctx).last_user_cycles {
@@ -509,24 +406,24 @@ unsafe fn do_cpu_perf(pp: u32, np: u32, prev: *const task_struct) {
                 let _ = CPU_PERF_STATS.insert(&pp, &*z, BPF_NOEXIST as u64);
             }
             if let Some(p) = CPU_PERF_STATS.get_ptr_mut(&pp) {
-                task_comm(&mut (*p).comm, prev);
-                (*p).cgroup_id = task_cgid(prev);
+                (*prev).read_comm(&mut (*p).comm);
+                (*p).cgroup_id = (*prev).cgroup_id();
             }
         }
         if let Some(p) = CPU_PERF_STATS.get_ptr_mut(&pp) {
             if duc > 0 {
                 let s = slot_idx(log2_slot(duc));
-                add32(&mut (*p).data.user_cycles_hist.slots[s], 1);
+                add_to_u32(&mut (*p).data.user_cycles_hist.slots[s], 1);
             }
             if dkc > 0 {
                 let s = slot_idx(log2_slot(dkc));
-                add32(&mut (*p).data.kernel_cycles_hist.slots[s], 1);
+                add_to_u32(&mut (*p).data.kernel_cycles_hist.slots[s], 1);
             }
-            add64(&mut (*p).data.total_user_cycles, duc);
-            add64(&mut (*p).data.total_kernel_cycles, dkc);
-            add64(&mut (*p).data.total_user_instructions, dui);
-            add64(&mut (*p).data.total_kernel_instructions, dki);
-            add64(&mut (*p).data.sample_count, 1);
+            add_to_u64(&mut (*p).data.total_user_cycles, duc);
+            add_to_u64(&mut (*p).data.total_kernel_cycles, dkc);
+            add_to_u64(&mut (*p).data.total_user_instructions, dui);
+            add_to_u64(&mut (*p).data.total_kernel_instructions, dki);
+            add_to_u64(&mut (*p).data.sample_count, 1);
         }
     }
     (*ctx).last_user_cycles = uc;
@@ -538,7 +435,7 @@ unsafe fn do_cpu_perf(pp: u32, np: u32, prev: *const task_struct) {
 
 #[inline(always)]
 unsafe fn do_generic_perf(pp: u32, np: u32, prev: *const task_struct) {
-    let n = n_generic() as usize;
+    let n = read_volatile_u32(&NUM_GENERIC_EVENTS) as usize;
     if n == 0 {
         return;
     }
@@ -555,8 +452,8 @@ unsafe fn do_generic_perf(pp: u32, np: u32, prev: *const task_struct) {
                 let _ = GENERIC_PERF_STATS.insert(&pp, &*z, BPF_NOEXIST as u64);
             }
             if let Some(p) = GENERIC_PERF_STATS.get_ptr_mut(&pp) {
-                task_comm(&mut (*p).comm, prev);
-                (*p).cgroup_id = task_cgid(prev);
+                (*prev).read_comm(&mut (*p).comm);
+                (*p).cgroup_id = (*prev).cgroup_id();
             }
         }
         data = GENERIC_PERF_STATS.get_ptr_mut(&pp);
@@ -566,14 +463,14 @@ unsafe fn do_generic_perf(pp: u32, np: u32, prev: *const task_struct) {
         ($i:expr) => {
             if n > $i {
                 let cur = match $i {
-                    0 => read_perf(&GENERIC_PERF_ARRAY_0),
-                    1 => read_perf(&GENERIC_PERF_ARRAY_1),
-                    2 => read_perf(&GENERIC_PERF_ARRAY_2),
-                    3 => read_perf(&GENERIC_PERF_ARRAY_3),
-                    4 => read_perf(&GENERIC_PERF_ARRAY_4),
-                    5 => read_perf(&GENERIC_PERF_ARRAY_5),
-                    6 => read_perf(&GENERIC_PERF_ARRAY_6),
-                    7 => read_perf(&GENERIC_PERF_ARRAY_7),
+                    0 => read_perf_counter(&GENERIC_PERF_ARRAY_0),
+                    1 => read_perf_counter(&GENERIC_PERF_ARRAY_1),
+                    2 => read_perf_counter(&GENERIC_PERF_ARRAY_2),
+                    3 => read_perf_counter(&GENERIC_PERF_ARRAY_3),
+                    4 => read_perf_counter(&GENERIC_PERF_ARRAY_4),
+                    5 => read_perf_counter(&GENERIC_PERF_ARRAY_5),
+                    6 => read_perf_counter(&GENERIC_PERF_ARRAY_6),
+                    7 => read_perf_counter(&GENERIC_PERF_ARRAY_7),
                     _ => 0,
                 };
                 if has_prev {
@@ -584,7 +481,7 @@ unsafe fn do_generic_perf(pp: u32, np: u32, prev: *const task_struct) {
                             0
                         };
                         if d > 0 {
-                            add64(&mut (*p).counters[$i], d);
+                            add_to_u64(&mut (*p).counters[$i], d);
                         }
                     }
                 }
@@ -605,7 +502,7 @@ unsafe fn do_generic_perf(pp: u32, np: u32, prev: *const task_struct) {
 
 #[inline(always)]
 unsafe fn do_migrate(t: *const task_struct, dest_cpu: i32) -> i32 {
-    let pid = task_pid(t);
+    let pid = (*t).pid();
     if pid == 0 {
         return 0;
     }
@@ -615,23 +512,23 @@ unsafe fn do_migrate(t: *const task_struct, dest_cpu: i32) -> i32 {
             let _ = MIGRATION_COUNTS.insert(&pid, &*z, BPF_NOEXIST as u64);
         }
         if let Some(p) = MIGRATION_COUNTS.get_ptr_mut(&pid) {
-            task_comm(&mut (*p).comm, t);
-            (*p).cgroup_id = task_cgid(t);
+            (*t).read_comm(&mut (*p).comm);
+            (*p).cgroup_id = (*t).cgroup_id();
         }
     }
     if let Some(p) = MIGRATION_COUNTS.get_ptr_mut(&pid) {
-        add64(&mut (*p).count, 1);
-        let oc = rf(&(*t).wake_cpu).unwrap_or(-1);
+        add_to_u64(&mut (*p).count, 1);
+        let oc = (*t).wake_cpu();
         if oc >= 0 && oc < MAX_CPUS as i32 && dest_cpu >= 0 && dest_cpu < MAX_CPUS as i32 {
-            let on = core::ptr::read_volatile(&CPU_TO_NUMA[oc as usize]);
-            let dn = core::ptr::read_volatile(&CPU_TO_NUMA[dest_cpu as usize]);
+            let on = read_volatile_i32(&CPU_TO_NUMA[oc as usize]);
+            let dn = read_volatile_i32(&CPU_TO_NUMA[dest_cpu as usize]);
             if on >= 0 && dn >= 0 && on != dn {
-                add64(&mut (*p).cross_numa_count, 1);
+                add_to_u64(&mut (*p).cross_numa_count, 1);
             } else {
-                let od = core::ptr::read_volatile(&CPU_TO_DIE[oc as usize]);
-                let dd = core::ptr::read_volatile(&CPU_TO_DIE[dest_cpu as usize]);
+                let od = read_volatile_i32(&CPU_TO_DIE[oc as usize]);
+                let dd = read_volatile_i32(&CPU_TO_DIE[dest_cpu as usize]);
                 if od >= 0 && dd >= 0 && od != dd {
-                    add64(&mut (*p).cross_ccx_count, 1);
+                    add_to_u64(&mut (*p).cross_ccx_count, 1);
                 }
             }
         }
@@ -641,9 +538,9 @@ unsafe fn do_migrate(t: *const task_struct, dest_cpu: i32) -> i32 {
 
 #[inline(always)]
 unsafe fn do_exit(t: *const task_struct) -> i32 {
-    let pid = task_pid(t);
+    let pid = (*t).pid();
     let _ = ENQUEUE_TIME.remove(&pid);
-    if trace_waking() {
+    if read_volatile_u32(&TRACE_SCHED_WAKING) != 0 {
         let _ = WAKING_TIME.remove(&pid);
         let _ = WAKING_DELAY.remove(&pid);
     }
