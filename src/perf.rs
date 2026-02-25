@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 use anyhow::{bail, Result};
-use libbpf_rs::{Map, MapCore, MapFlags};
-use std::os::unix::io::RawFd;
+use aya::maps::MapData;
+use std::os::unix::io::{AsFd, AsRawFd, RawFd};
 
 const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 0x00000008;
 
@@ -85,18 +85,17 @@ impl PerfCounterSetup {
         Self { fds: Vec::new() }
     }
 
-    /// Setup performance counters and attach them to BPF maps
-    /// Changed to use the generated RschedMaps type
-    pub fn setup_and_attach(&mut self, maps: &crate::RschedMaps) -> Result<()> {
+    /// Setup IPC performance counters and attach them to BPF perf event array maps.
+    /// Takes the 4 perf event array maps by MapData reference.
+    pub fn setup_and_attach(
+        &mut self,
+        user_cycles_map: &mut MapData,
+        kernel_cycles_map: &mut MapData,
+        user_instructions_map: &mut MapData,
+        kernel_instructions_map: &mut MapData,
+    ) -> Result<()> {
         let num_cpus = num_cpus::get();
 
-        // Get the BPF perf event array maps using the generated accessors
-        let user_cycles_map = &maps.user_cycles_array;
-        let kernel_cycles_map = &maps.kernel_cycles_array;
-        let user_instructions_map = &maps.user_instructions_array;
-        let kernel_instructions_map = &maps.kernel_instructions_array;
-
-        // Setup counters for each CPU
         for cpu in 0..num_cpus {
             let mut cpu_fds = Vec::new();
 
@@ -107,7 +106,6 @@ impl PerfCounterSetup {
                 true,  // exclude_kernel
                 false, // exclude_user
             )?;
-
             self.attach_to_map(user_cycles_map, cpu, fd)?;
             cpu_fds.push(fd);
 
@@ -161,53 +159,42 @@ impl PerfCounterSetup {
             ..Default::default()
         };
 
-        // Set the exclusion bits in the flags field
         if exclude_kernel {
             attr.flags |= PERF_ATTR_BIT_EXCLUDE_KERNEL;
         }
         if exclude_user {
             attr.flags |= PERF_ATTR_BIT_EXCLUDE_USER;
         }
-        // Always exclude hypervisor and idle
         attr.flags |= PERF_ATTR_BIT_EXCLUDE_HV | PERF_ATTR_BIT_EXCLUDE_IDLE;
 
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_perf_event_open,
                 &attr as *const PerfEventAttr,
-                -1i32 as libc::pid_t, // pid = -1 means all processes
-                cpu,                  // cpu
-                -1,                   // group_fd
-                PERF_FLAG_FD_CLOEXEC, // flags
+                -1i32 as libc::pid_t,
+                cpu,
+                -1,
+                PERF_FLAG_FD_CLOEXEC,
             )
         };
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();
-
-            // Try without exclusion flags to see if that's the issue
             if exclude_kernel || exclude_user {
                 eprintln!(
                     "Note: CPU {} may not support hardware event exclusion flags",
                     cpu
                 );
             }
-
             bail!(
                 "Failed to open perf event (CPU {}, config {}, exclude_kernel={}, exclude_user={}): {}",
-                cpu,
-                config,
-                exclude_kernel,
-                exclude_user,
-                err
+                cpu, config, exclude_kernel, exclude_user, err
             );
         }
 
         let fd = fd as RawFd;
 
-        // Enable the counter
         let ret = unsafe { libc::ioctl(fd, PERF_EVENT_IOC_ENABLE as _, 0) };
-
         if ret < 0 {
             unsafe {
                 libc::close(fd);
@@ -218,9 +205,7 @@ impl PerfCounterSetup {
             );
         }
 
-        // Reset counter to 0
         let ret = unsafe { libc::ioctl(fd, PERF_EVENT_IOC_RESET as _, 0) };
-
         if ret < 0 {
             unsafe {
                 libc::close(fd);
@@ -243,7 +228,6 @@ impl PerfCounterSetup {
             ..Default::default()
         };
 
-        // Exclude hypervisor and idle, but count both user and kernel
         attr.flags |= PERF_ATTR_BIT_EXCLUDE_HV | PERF_ATTR_BIT_EXCLUDE_IDLE;
 
         let fd = unsafe {
@@ -296,13 +280,14 @@ impl PerfCounterSetup {
     }
 
     /// Setup generic perf events and attach to BPF maps.
-    ///
-    /// `events` is a list of (perf_type, config) pairs for each generic slot.
-    /// `maps` is the list of generic_perf_array_N maps (one per event).
-    pub fn setup_generic_events(&mut self, events: &[(u32, u64)], maps: &[&Map]) -> Result<()> {
+    pub fn setup_generic_events(
+        &mut self,
+        events: &[(u32, u64)],
+        maps: &mut [&mut MapData],
+    ) -> Result<()> {
         let num_cpus = num_cpus::get();
 
-        for (slot, ((perf_type, config), map)) in events.iter().zip(maps.iter()).enumerate() {
+        for (slot, ((perf_type, config), map)) in events.iter().zip(maps.iter_mut()).enumerate() {
             for cpu in 0..num_cpus {
                 let fd = self
                     .open_typed_perf_event(*perf_type, *config, cpu as i32)
@@ -312,7 +297,6 @@ impl PerfCounterSetup {
 
                 self.attach_to_map(map, cpu, fd)?;
 
-                // Store FD for cleanup
                 while self.fds.len() <= cpu {
                     self.fds.push(Vec::new());
                 }
@@ -323,13 +307,44 @@ impl PerfCounterSetup {
         Ok(())
     }
 
-    fn attach_to_map(&self, map: &Map, cpu: usize, fd: RawFd) -> Result<()> {
-        let key_bytes = (cpu as u32).to_ne_bytes();
-        let fd_val = fd.to_ne_bytes();
-        map.update(&key_bytes, &fd_val, MapFlags::ANY)?;
+    fn attach_to_map(&self, map: &mut MapData, cpu: usize, fd: RawFd) -> Result<()> {
+        // For perf event arrays in aya, we need to use the raw map fd
+        // to set the perf event fd at the CPU index
+        let map_fd = map.fd().as_fd().as_raw_fd();
+        let key = (cpu as u32).to_ne_bytes();
+        let value = fd.to_ne_bytes();
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                2u32, // BPF_MAP_UPDATE_ELEM
+                &BpfMapUpdateAttr {
+                    map_fd: map_fd as u32,
+                    key: key.as_ptr() as u64,
+                    value: value.as_ptr() as u64,
+                    flags: 0, // BPF_ANY
+                } as *const BpfMapUpdateAttr,
+                std::mem::size_of::<BpfMapUpdateAttr>(),
+            )
+        };
+
+        if ret < 0 {
+            bail!(
+                "Failed to attach perf event fd to map: {}",
+                std::io::Error::last_os_error()
+            );
+        }
 
         Ok(())
     }
+}
+
+#[repr(C)]
+struct BpfMapUpdateAttr {
+    map_fd: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
 }
 
 #[cfg(test)]
@@ -338,10 +353,9 @@ mod tests {
 
     #[test]
     fn test_perf_event_attr_size() {
-        // Ensure our struct matches the expected size
         assert_eq!(
             std::mem::size_of::<PerfEventAttr>(),
-            112, // Expected size on x86_64
+            112,
             "PerfEventAttr size mismatch"
         );
     }

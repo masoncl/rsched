@@ -3,26 +3,13 @@ use crate::rsched_collector::Hist;
 use crate::rsched_stats::{FilterOptions, OutputMode};
 use std::collections::HashMap;
 
-#[repr(C)]
-#[derive(Default, Copy, Clone)]
-pub struct CpuPerfData {
-    pub user_cycles_hist: Hist,
-    pub kernel_cycles_hist: Hist,
-    pub total_user_cycles: u64,
-    pub total_kernel_cycles: u64,
-    pub total_user_instructions: u64,
-    pub total_kernel_instructions: u64,
-    pub sample_count: u64,
-}
-
-unsafe impl plain::Plain for CpuPerfData {}
+// CpuPerfData is now defined in rsched-common, re-exported via rsched_collector
+pub use rsched_common::CpuPerfData;
 
 pub struct CpuMetrics {
     pid_metrics: HashMap<u32, PidCpuMetrics>,
     /// Per-PID log2 histograms of per-second event rates, one Hist per event.
     generic_pid_hists: HashMap<u32, GenericPidHists>,
-    /// Previous tick's raw counters for delta computation.
-    last_generic_counters: HashMap<u32, Vec<u64>>,
     generic_event_names: Vec<String>,
     last_update_time: std::time::Instant,
 }
@@ -102,7 +89,6 @@ impl CpuMetrics {
         Self {
             pid_metrics: HashMap::new(),
             generic_pid_hists: HashMap::new(),
-            last_generic_counters: HashMap::new(),
             generic_event_names,
             last_update_time: std::time::Instant::now(),
         }
@@ -159,22 +145,16 @@ impl CpuMetrics {
             hists.comm.clone_from(&comm);
             hists.cgroup_id = cgroup_id;
 
-            // Compute deltas from previous tick
-            if let Some(prev) = self.last_generic_counters.get(&pid) {
-                for i in 0..num_events {
-                    let delta = counters[i].saturating_sub(prev[i]);
-                    if delta > 0 {
-                        let slot = log2_slot(delta);
-                        if slot < crate::rsched_collector::MAX_SLOTS {
-                            hists.hists[i].slots[slot] += 1;
-                        }
+            // The BPF program accumulates per-PID counter deltas between map drains.
+            // The collected values are already deltas, so record them directly.
+            for (i, &delta) in counters[..num_events].iter().enumerate() {
+                if delta > 0 {
+                    let slot = log2_slot(delta);
+                    if slot < crate::rsched_collector::MAX_SLOTS {
+                        hists.hists[i].slots[slot] += 1;
                     }
                 }
             }
-
-            // Store current counters for next tick
-            self.last_generic_counters
-                .insert(pid, counters[..num_events].to_vec());
         }
     }
 
@@ -217,7 +197,6 @@ impl CpuMetrics {
         // Clear incremental data for next interval
         self.pid_metrics.clear();
         self.generic_pid_hists.clear();
-        self.last_generic_counters.clear();
     }
 
     fn build_process_entries(
