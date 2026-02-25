@@ -1,7 +1,12 @@
-//! Safe wrappers around BPF helper functions.
+//! Wrappers around BPF helper functions.
 //!
-//! Each function contains a single `unsafe` block internally so callers
-//! in `main.rs` and `vmlinux.rs` read as safe Rust.
+//! `probe_read` / `probe_read_str` are `unsafe` — they take raw pointers
+//! whose validity cannot be checked at compile time. The safe boundary for
+//! kernel struct reads is the `task_struct` method layer in `vmlinux.rs`.
+//!
+//! The remaining helpers (`ktime_ns`, `current_cpu`, `read_volatile_*`,
+//! `read_perf_counter`) are genuinely safe: they either take no problematic
+//! arguments or accept references that guarantee validity.
 
 use aya_ebpf::{
     bindings::bpf_perf_event_value,
@@ -11,17 +16,23 @@ use aya_ebpf::{
 use core::ffi::c_void;
 
 /// Read a value from kernel memory via `bpf_probe_read_kernel`.
+///
+/// # Safety
+///
+/// `ptr` must point to readable kernel memory containing a valid `T`.
 #[inline(always)]
-pub fn probe_read<T: Copy>(ptr: *const T) -> Option<T> {
-    unsafe { bpf_probe_read_kernel(ptr).ok() }
+pub unsafe fn probe_read<T: Copy>(ptr: *const T) -> Option<T> {
+    bpf_probe_read_kernel(ptr).ok()
 }
 
 /// Read a null-terminated string from kernel memory into `dst`.
+///
+/// # Safety
+///
+/// `src` must point to a readable kernel string.
 #[inline(always)]
-pub fn probe_read_str(src: *const u8, dst: &mut [u8]) {
-    unsafe {
-        let _ = helpers::bpf_probe_read_kernel_str_bytes(src, dst);
-    }
+pub unsafe fn probe_read_str(src: *const u8, dst: &mut [u8]) {
+    let _ = helpers::bpf_probe_read_kernel_str_bytes(src, dst);
 }
 
 /// Get the current monotonic time in nanoseconds.

@@ -47,46 +47,59 @@ pub struct task_struct {
 }
 
 impl task_struct {
+    // Safety argument for all methods below:
+    // `&self` is a valid reference, so `&self.field` computes a valid kernel
+    // address via pointer arithmetic (no memory read). `bpf_probe_read_kernel`
+    // handles invalid target addresses gracefully (returns -EFAULT), so these
+    // methods cannot cause UB regardless of what `self` points to.
+
     #[inline(always)]
     pub fn pid(&self) -> u32 {
-        bpf_helpers::probe_read(&self.pid).unwrap_or(0) as u32
+        // SAFETY: &self.pid is a valid kernel address derived from &self
+        unsafe { bpf_helpers::probe_read(&self.pid) }.unwrap_or(0) as u32
     }
 
     #[inline(always)]
     pub fn state(&self) -> u32 {
-        bpf_helpers::probe_read(&self.__state).unwrap_or(0)
+        // SAFETY: &self.__state is a valid kernel address derived from &self
+        unsafe { bpf_helpers::probe_read(&self.__state) }.unwrap_or(0)
     }
 
     #[inline(always)]
     pub fn cpu(&self) -> i32 {
-        bpf_helpers::probe_read(&self.thread_info.cpu).unwrap_or(0) as i32
+        // SAFETY: &self.thread_info.cpu is a valid kernel address derived from &self
+        unsafe { bpf_helpers::probe_read(&self.thread_info.cpu) }.unwrap_or(0) as i32
     }
 
     #[inline(always)]
     pub fn wake_cpu(&self) -> i32 {
-        bpf_helpers::probe_read(&self.wake_cpu).unwrap_or(-1)
+        // SAFETY: &self.wake_cpu is a valid kernel address derived from &self
+        unsafe { bpf_helpers::probe_read(&self.wake_cpu) }.unwrap_or(-1)
     }
 
     #[inline(always)]
     pub fn read_comm(&self, buf: &mut [u8; TASK_COMM_LEN]) {
-        bpf_helpers::probe_read_str(self.comm.as_ptr() as *const u8, buf);
+        // SAFETY: self.comm.as_ptr() is a valid kernel address derived from &self
+        unsafe { bpf_helpers::probe_read_str(self.comm.as_ptr() as *const u8, buf) };
     }
 
     #[inline(always)]
     pub fn cgroup_id(&self) -> u64 {
-        let cs: *const css_set = match bpf_helpers::probe_read(&self.cgroups) {
+        // SAFETY: each probe_read targets a kernel address either derived from
+        // &self or from a non-null pointer returned by a previous probe_read.
+        let cs: *const css_set = match unsafe { bpf_helpers::probe_read(&self.cgroups) } {
             Some(p) if !p.is_null() => p,
             _ => return 0,
         };
-        let cg: *const cgroup = match bpf_helpers::probe_read(unsafe { &(*cs).dfl_cgrp }) {
+        let cg: *const cgroup = match unsafe { bpf_helpers::probe_read(&(*cs).dfl_cgrp) } {
             Some(p) if !p.is_null() => p,
             _ => return 0,
         };
-        let kn: *const kernfs_node = match bpf_helpers::probe_read(unsafe { &(*cg).kn }) {
+        let kn: *const kernfs_node = match unsafe { bpf_helpers::probe_read(&(*cg).kn) } {
             Some(p) if !p.is_null() => p,
             _ => return 0,
         };
-        bpf_helpers::probe_read(unsafe { &(*kn).id }).unwrap_or(0)
+        unsafe { bpf_helpers::probe_read(&(*kn).id) }.unwrap_or(0)
     }
 
     /// Get nr_running via task->se.cfs_rq->nr_running.
@@ -94,14 +107,15 @@ impl task_struct {
     /// cfs_rq.nr_running at offset 16.
     #[inline(always)]
     pub fn cfs_rq_nr_running(&self) -> u64 {
+        // SAFETY: address arithmetic from &self, then probe_read handles faults.
         let cfs_rq_ptr_addr =
             unsafe { (self as *const _ as *const u8).add(352) as *const *const u8 };
-        let cfs_rq: *const u8 = match bpf_helpers::probe_read(cfs_rq_ptr_addr) {
+        let cfs_rq: *const u8 = match unsafe { bpf_helpers::probe_read(cfs_rq_ptr_addr) } {
             Some(p) if !p.is_null() => p,
             _ => return 0,
         };
         let nr_addr = unsafe { cfs_rq.add(16) as *const u32 };
-        match bpf_helpers::probe_read(nr_addr) {
+        match unsafe { bpf_helpers::probe_read(nr_addr) } {
             Some(v) => v as u64,
             _ => 0,
         }
