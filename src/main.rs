@@ -511,9 +511,10 @@ fn main() -> Result<()> {
 
     // Set global configuration before loading
     let waking_val = metric_groups.waking as u32;
-    loader.set_global("TRACE_SCHED_WAKING", &waking_val, true);
     let n_generic_val = generic_event_configs.len() as u32;
-    loader.set_global("NUM_GENERIC_EVENTS", &n_generic_val, true);
+    loader
+        .set_global("TRACE_SCHED_WAKING", &waking_val, true)
+        .set_global("NUM_GENERIC_EVENTS", &n_generic_val, true);
 
     // Set topology tables
     if let Some(ref topo) = topo {
@@ -585,24 +586,32 @@ fn main() -> Result<()> {
     }
 
     // Setup perf counters
+    // Keep perf event array MapData alive for the lifetime of the program
+    // so their kernel FDs stay open.
+    let mut _perf_map_data: Vec<MapData> = Vec::new();
     let _perf_setup = if metric_groups.perf {
         let mut setup = PerfCounterSetup::new();
 
-        if has_ipc {
-            // Extract MapData from PerfEventArray maps for direct fd access
-            fn get_map_data(bpf: &mut aya::Ebpf, name: &str) -> MapData {
-                match bpf.take_map(name).unwrap() {
-                    aya::maps::Map::PerfEventArray(md) => md,
-                    _ => panic!("{} is not a PerfEventArray", name),
-                }
+        fn take_perf_map(bpf: &mut aya::Ebpf, name: &str) -> MapData {
+            match bpf.take_map(name).unwrap() {
+                aya::maps::Map::PerfEventArray(md) => md,
+                _ => panic!("{} is not a PerfEventArray", name),
             }
-            let mut uc_map = get_map_data(&mut bpf, "USER_CYCLES_ARRAY");
-            let mut kc_map = get_map_data(&mut bpf, "KERNEL_CYCLES_ARRAY");
-            let mut ui_map = get_map_data(&mut bpf, "USER_INSTRUCTIONS_ARRAY");
-            let mut ki_map = get_map_data(&mut bpf, "KERNEL_INSTRUCTIONS_ARRAY");
+        }
+
+        if has_ipc {
+            let mut uc_map = take_perf_map(&mut bpf, "USER_CYCLES_ARRAY");
+            let mut kc_map = take_perf_map(&mut bpf, "KERNEL_CYCLES_ARRAY");
+            let mut ui_map = take_perf_map(&mut bpf, "USER_INSTRUCTIONS_ARRAY");
+            let mut ki_map = take_perf_map(&mut bpf, "KERNEL_INSTRUCTIONS_ARRAY");
 
             setup.setup_and_attach(&mut uc_map, &mut kc_map, &mut ui_map, &mut ki_map)?;
             println!("CPU performance counters enabled (IPC)");
+
+            _perf_map_data.push(uc_map);
+            _perf_map_data.push(kc_map);
+            _perf_map_data.push(ui_map);
+            _perf_map_data.push(ki_map);
         }
 
         if !generic_event_configs.is_empty() {
@@ -619,16 +628,14 @@ fn main() -> Result<()> {
 
             let mut generic_maps: Vec<MapData> = Vec::new();
             for name in &generic_map_names[..generic_event_configs.len()] {
-                generic_maps.push(match bpf.take_map(name).unwrap() {
-                    aya::maps::Map::PerfEventArray(md) => md,
-                    _ => panic!("{} is not a PerfEventArray", name),
-                });
+                generic_maps.push(take_perf_map(&mut bpf, name));
             }
 
             let mut map_refs: Vec<&mut MapData> = generic_maps.iter_mut().collect();
             setup.setup_generic_events(&generic_event_configs, &mut map_refs)?;
 
             println!("Generic perf events: {}", generic_event_names.join(", "));
+            _perf_map_data.extend(generic_maps);
         }
 
         Some(setup)
