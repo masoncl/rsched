@@ -82,21 +82,3 @@ pub fn read_volatile_u32(ptr: &u32) -> u32 {
 pub fn read_volatile_i32(ptr: &i32) -> i32 {
     unsafe { core::ptr::read_volatile(ptr) }
 }
-
-/// Add `val` to the `u32` at `ptr` using volatile read/write.
-#[inline(always)]
-pub fn add_to_u32(ptr: *mut u32, val: u32) {
-    unsafe {
-        let o = core::ptr::read_volatile(ptr);
-        core::ptr::write_volatile(ptr, o.wrapping_add(val));
-    }
-}
-
-/// Add `val` to the `u64` at `ptr` using volatile read/write.
-#[inline(always)]
-pub fn add_to_u64(ptr: *mut u64, val: u64) {
-    unsafe {
-        let o = core::ptr::read_volatile(ptr);
-        core::ptr::write_volatile(ptr, o.wrapping_add(val));
-    }
-}
